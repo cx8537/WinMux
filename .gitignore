@@ -1,0 +1,57 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# IDE
+.idea/
+.vs/
+*.swp
+*.swo
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Logs and temp
+*.log
+*.tmp
+*.bak
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Coverage
+coverage/
+*.profraw
+
+# Benchmarks
+criterion/
+flamegraph.svg
+*.perf
+
+# Build artifacts not yet tracked
+*.exe
+!*.exe.manifest
+*.msi
+*.nsi
+*.zip
+
+# Local user data accidentally committed
+winmux.toml.local
+audit.sqlite
+audit.sqlite-*

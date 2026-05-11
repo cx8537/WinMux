@@ -1,0 +1,17 @@
+# Project-wide Clippy configuration.
+# Lint allow/deny lists live in Cargo.toml workspace.lints — see that
+# file for the source of truth. This file only configures parameters
+# of specific lints.
+
+# MSRV: pinned in rust-toolchain.toml; clippy reads it from there.
+
+# Cognitive complexity threshold for clippy::cognitive_complexity.
+cognitive-complexity-threshold = 30
+
+# Allow doc links to private items, since intra-crate docs are useful
+# without going through pub re-exports.
+allow-private-intra-doc-links = true
+
+# Permitted to use `print!` family of macros in these test/build paths
+# only. Production paths use tracing; see CLAUDE.md.
+allowed-scripts = ["Latin"]
