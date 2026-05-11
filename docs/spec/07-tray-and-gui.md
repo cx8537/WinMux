@@ -1,6 +1,7 @@
 # 07 — Tray and GUI
 
 > `winmux-tray.exe`: the Tauri app. Tray icon, main window, panels.
+> Color tokens and themes.
 
 The tray is the user-facing GUI for WinMux. It is always running when
 WinMux is in use, displaying a tray icon that opens the main window
@@ -31,13 +32,13 @@ needed" mode.
 
 - **Normal:** default monochrome icon.
 - **Active sessions:** small dot on the icon when there are sessions
-  (more than zero).
-- **Sensitive session active:** red dot when any session has
-  disk-backed scrollback enabled.
-- **Server unresponsive:** yellow exclamation overlay if a `Ping`
-  hasn't been answered within 30 s. Click to view details.
-- **Crashed:** red X overlay if the connection to the server has
-  dropped and reconnect attempts have exhausted. Click to restart.
+  (more than zero). Uses `--status-info` token.
+- **Sensitive session active:** dot uses `--status-error` token when
+  any session has disk-backed scrollback enabled.
+- **Server unresponsive:** small overlay using `--status-warn` token
+  if a `Ping` hasn't been answered within 90 s.
+- **Crashed:** overlay using `--status-error` token if reconnect
+  attempts have exhausted. Click to restart.
 
 ### Left-click
 
@@ -107,14 +108,15 @@ call to GitHub Releases API).
 Components:
 
 - **Sessions panel (left).** Collapsible. Lists sessions; active
-  session is highlighted with `*`. Right-click for rename, kill.
+  session is highlighted with `--bg-active`. Right-click for rename,
+  kill.
 - **Main area (right).** Title bar of the active window, the panel
   layout (xterm.js panes), and a window bar at the bottom.
 - **Window bar.** Tabs for windows in the active session. Active one
   highlighted. `+` for new window.
 - **Status bar.** Driven by `status-format` from `.tmux.conf`, with
   format strings resolved. Default shows server health, prefix key,
-  encoding, shell info.
+  encoding, shell info. Background uses `--bg-secondary`.
 
 ### Window chrome
 
@@ -175,9 +177,8 @@ sizes.
 
 ### Active pane indicator
 
-The active pane has a subtle border highlight (active border color
-from `pane-active-border-style`). Inactive panes have a muted border
-(`pane-border-style`).
+The active pane has a subtle border highlight using
+`--pane-border-active`. Inactive panes use `--pane-border`.
 
 ### Zoom
 
@@ -192,8 +193,8 @@ hidden ref to avoid losing state.
 
 Left sidebar. Lists sessions:
 
-- **Selected session** is highlighted; clicking the main area shows
-  its windows.
+- **Selected session** is highlighted with `--bg-active`; clicking
+  the main area shows its windows.
 - Right-click on a session: rename, kill, "open in new window"
   (M3+).
 - Bottom: `+ New session` opens the NewSession modal.
@@ -228,6 +229,8 @@ Tabs:
 1. **General**
    - UI language (System / English / 한국어).
    - Color theme (Dark only in M1; Dark / Light / System in M2+).
+   - Terminal palette (Campbell / One Dark / Solarized Dark /
+     Tokyo Night / Custom — M2+).
    - Font family and size.
    - Autostart toggle.
 2. **Terminal**
@@ -271,26 +274,223 @@ in Settings → General.
 
 ## Themes
 
-### Dark (M1, default)
+WinMux has **two independent theme surfaces**, and they intentionally
+use different palettes:
 
-Inspired by Tokyo Night / Solarized Dark, but tuned. Defined as
-Tailwind CSS variables in `src/styles/theme-dark.css`.
+| Surface | Palette source | Reasoning |
+| --- | --- | --- |
+| UI chrome (tray, window, sidebar, modals, status bar) | **IntelliJ Darcula**-derived | Optimized for hours-long reading; developer-familiar; not pure black |
+| Terminal interior (xterm.js content) | **Windows Terminal "Campbell"** ANSI 16 | Familiar to Windows users; `vim`/`ls`/`git` look the way users expect |
+| Status signal colors (overlays, indicators) | **Quiet-by-default** | Normal state is silent; only abnormal states use color |
 
-ANSI 16 palette: a balanced set with high contrast for readability.
+Mixing these surfaces into one palette would compromise both. They
+are governed by separate CSS variable namespaces.
 
-### Light (M2+)
+### Why these choices
 
-A clean light theme. Same palette inverted where appropriate.
+- **IntelliJ Darcula for the chrome.** Among the three candidates we
+  considered (IntelliJ Darcula, Sidabari's dashboard aesthetic, raw
+  tmux/terminal colors), Darcula is the one designed for long-form
+  *reading* of code. Backgrounds are not pure black (`#1E1F22` rather
+  than `#000000`), foreground is not pure white (`#BCBEC4` rather
+  than `#FFFFFF`), and contrast is dialed for legibility without
+  glare. WinMux's main window is something users will keep open all
+  day; the chrome must not be visually loud.
 
-### System (M2+)
+- **Campbell for the terminal.** It is the default Windows Terminal
+  palette, ships with Cascadia Code, and matches the colors Windows
+  developers already know. A `vim`, `ls --color`, or `git status` in
+  a WinMux pane should look exactly like the same command in
+  Windows Terminal. Users can pick another preset (One Dark, etc.)
+  in M2+.
 
-Follow Windows app mode (`AppsUseLightTheme` registry value, watched
-for change).
+- **Quiet status signaling.** Sidabari's dashboard look is
+  attention-grabbing by design — it is *meant* to be looked at for
+  five minutes to triage an incident. WinMux is the opposite use
+  case: ambient, all-day. We borrow only one principle from
+  Sidabari: *normal is silent, abnormal is colored.* No green "OK"
+  indicators. No traffic lights when nothing is wrong.
 
-### Custom
+---
 
-Not in M1–M4. May be addressed later by accepting `.tmuxrc`-style
-color directives.
+## Dark Theme (M1 Default)
+
+### UI chrome tokens
+
+Defined as Tailwind CSS variables in `src/styles/theme-dark.css`:
+
+```css
+:root[data-theme="dark"] {
+  /* Surfaces */
+  --bg-primary:        #1E1F22;  /* main content area */
+  --bg-secondary:      #2B2D30;  /* sidebar, status bar, panels */
+  --bg-tertiary:       #3C3F41;  /* hover, input fields, code blocks */
+  --bg-active:         #2E436E;  /* selected items (IntelliJ blue) */
+  --bg-overlay:        rgba(30, 31, 34, 0.85);  /* modal backdrop */
+
+  /* Borders */
+  --border-subtle:     #393B40;  /* between panels */
+  --border-strong:     #4E5157;  /* input fields, dividers */
+  --border-focus:      #4A88C7;  /* focus ring */
+
+  /* Text */
+  --text-primary:      #BCBEC4;  /* body text */
+  --text-secondary:    #868A91;  /* muted, labels, captions */
+  --text-disabled:     #54585E;  /* disabled controls */
+  --text-on-accent:    #FFFFFF;  /* text on accent-colored buttons */
+  --text-link:         #4A88C7;
+  --text-link-hover:   #5394D6;
+
+  /* Accent (interactive elements) */
+  --accent:            #4A88C7;  /* IntelliJ-style blue */
+  --accent-hover:      #5394D6;
+  --accent-active:     #3F77B0;
+
+  /* Pane borders */
+  --pane-border:           #393B40;
+  --pane-border-active:    #4A88C7;
+
+  /* Status signals — quiet by default */
+  --status-ok:         #54A150;  /* used sparingly */
+  --status-info:       #4A88C7;
+  --status-warn:       #C9A227;
+  --status-error:      #C75450;  /* IntelliJ error tone */
+}
+```
+
+### Terminal palette (Campbell)
+
+Passed to xterm.js `terminal.options.theme`:
+
+```typescript
+export const campbellPalette = {
+  background:     '#0C0C0C',
+  foreground:     '#CCCCCC',
+  cursor:         '#FFFFFF',
+  cursorAccent:   '#0C0C0C',
+  selectionBackground: 'rgba(255, 255, 255, 0.25)',
+
+  black:          '#0C0C0C',
+  red:            '#C50F1F',
+  green:          '#13A10E',
+  yellow:         '#C19C00',
+  blue:           '#0037DA',
+  magenta:        '#881798',
+  cyan:           '#3A96DD',
+  white:          '#CCCCCC',
+
+  brightBlack:    '#767676',
+  brightRed:      '#E74856',
+  brightGreen:    '#16C60C',
+  brightYellow:   '#F9F1A5',
+  brightBlue:    '#3B78FF',
+  brightMagenta:  '#B4009E',
+  brightCyan:     '#61D6D6',
+  brightWhite:    '#F2F2F2',
+} as const;
+```
+
+The terminal interior background (`#0C0C0C`) is intentionally darker
+than the surrounding UI chrome (`#1E1F22`). This visually separates
+the "content" (what your shell wrote) from the "frame" (what WinMux
+drew), and matches the convention in code editors that have a
+distinct editor background.
+
+### Where tokens are used
+
+| Component | Token |
+| --- | --- |
+| Main window background | `--bg-primary` |
+| Sessions sidebar background | `--bg-secondary` |
+| Status bar background | `--bg-secondary` |
+| Window bar (tabs) background | `--bg-secondary` |
+| Modal background | `--bg-secondary` |
+| Modal backdrop | `--bg-overlay` |
+| Button (default) | `--bg-tertiary` background, `--text-primary` text |
+| Button (primary action) | `--accent` background, `--text-on-accent` text |
+| Button (hover) | `--accent-hover` |
+| Input field | `--bg-tertiary` background, `--border-strong` border |
+| Input focus ring | `--border-focus` |
+| Selected session in sidebar | `--bg-active` background |
+| Pane border (inactive) | `--pane-border` |
+| Pane border (active) | `--pane-border-active` |
+| Status bar text (normal) | `--text-secondary` |
+| Status bar indicator (sensitive session) | `--status-error` |
+| Status bar indicator (server slow) | `--status-warn` |
+| Toast (info) | `--bg-tertiary` background, `--text-primary` text |
+| Toast (error) | `--status-error` accent stripe |
+
+Hard-coded hex values are forbidden in components — they bypass the
+theme system and break high-contrast mode. Lint catches this with a
+custom rule (M2+).
+
+### Light theme (M2+)
+
+A clean IntelliJ Light-derived theme. Same token names, different
+values:
+
+```css
+:root[data-theme="light"] {
+  --bg-primary:        #FFFFFF;
+  --bg-secondary:      #F7F8FA;
+  --bg-tertiary:       #EBECF0;
+  --bg-active:         #D4E3F7;
+  /* ... */
+  --text-primary:      #1F1F1F;  /* not pure black */
+  --text-secondary:    #6C707E;
+  --accent:            #3574F0;
+  /* ... */
+}
+```
+
+Light terminal palette (planned, M2+): a light variant of Campbell
+or "GitHub Light." TBD; the M2 release will lock in defaults.
+
+### System theme (M2+)
+
+Follows Windows app mode (`AppsUseLightTheme` registry value, watched
+for change via the Tauri side). Switches between the dark and light
+themes above.
+
+### High contrast (Windows accessibility)
+
+When Windows is in High Contrast mode, the WebView reports it via
+`prefers-contrast: more` and `forced-colors: active`. The theme
+yields to system colors:
+
+- UI chrome uses `CanvasText` / `Canvas` / `ButtonFace` system
+  tokens.
+- Terminal background and foreground use system tokens.
+- Pane border active uses `Highlight`.
+
+See [`../nonfunctional/accessibility.md`](../nonfunctional/accessibility.md)
+for the full contrast story.
+
+---
+
+## Terminal Palette Presets (M2+)
+
+Users can pick a different terminal palette in Settings → General.
+Built-in presets:
+
+| Preset | Default? | Note |
+| --- | --- | --- |
+| Campbell | ✓ (Dark) | Windows Terminal default |
+| One Dark | | Atom / VS Code "One Dark Pro" derived |
+| Solarized Dark | | Classic |
+| Tokyo Night | | Popular among Neovim users |
+| GitHub Light | (default if Light theme picked) | M2+ |
+| Custom | | User pastes ANSI 16 hex values into Settings |
+
+Switching presets only changes `terminal.options.theme`. The UI
+chrome stays on its IntelliJ-derived palette regardless. This is
+intentional: users who pick "Solarized Dark" for their shell don't
+want their sidebar repainted to match.
+
+`.tmux.conf` color directives (`pane-border-style fg=colour238`,
+status-bar colors) are honored for elements drawn *by the server's
+status format* — they remain in the ANSI palette. WinMux's own
+sidebar / modal / chrome are not affected by `.tmux.conf` colors.
 
 ---
 
@@ -301,6 +501,9 @@ Three classes:
 1. **In-window toasts.** shadcn/ui Sonner. Auto-dismiss after
    5 seconds, dismissible. Used for: "Build complete" from
    `display-message`, "Config reloaded", "Session created."
+   - Info: `--bg-tertiary` background.
+   - Warn: `--status-warn` accent stripe.
+   - Error: `--status-error` accent stripe.
 2. **Tray balloon notifications.** Windows-native (toast/banner).
    Used for: "Session work has activity", first-run welcome, server
    unresponsive warning.
@@ -314,6 +517,9 @@ Three classes:
 Bottom of the main window. Driven by `status-format` from
 `.tmux.conf`, with `#{...}` placeholders resolved.
 
+Background: `--bg-secondary`. Text: `--text-secondary` by default;
+fragments may explicitly use one of the `--status-*` tokens.
+
 Default if no custom format:
 
 ```
@@ -325,6 +531,15 @@ Right side:
 ```
 [12:34] [docs:2 windows]
 ```
+
+Indicators on the status bar:
+
+- **Sensitive session active.** Small red dot
+  (`--status-error`) next to the session name if any session has
+  disk-backed scrollback enabled.
+- **Server slow.** Yellow dot (`--status-warn`) if ping round-trip
+  exceeds 2 s for three consecutive pings.
+- **Otherwise: silent.** No green "ok" lamp.
 
 ---
 
@@ -366,5 +581,6 @@ This requires:
 - Key handling and IME details → [`04-key-handling.md`](04-key-handling.md)
 - Session/window/pane model → [`03-session-model.md`](03-session-model.md)
 - i18n → [`10-i18n.md`](10-i18n.md)
-- Accessibility (keyboard, screen reader basics) →
+- Accessibility (keyboard, screen reader basics, high-contrast) →
   [`../nonfunctional/accessibility.md`](../nonfunctional/accessibility.md)
+- Configuration tokens user-overridable → [`09-config.md`](09-config.md)
