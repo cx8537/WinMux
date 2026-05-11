@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/winmux-protocol",
+    "crates/winmux-server",
+    "crates/winmux-tray",
+    "crates/winmux-cli",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cx8537/WinMux"
+
+# Lint tables per docs/conventions/coding-rust.md § Lints.
+# CI enforces these via `cargo clippy --workspace --all-targets -- -D warnings`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Release profile per docs/build/release.md § Build Profile.
+# `panic = "abort"` is mandatory (see docs/nonfunctional/stability.md):
+# release builds do not unwind; the panic hook writes a crash log and
+# the Job Object reaps child shells.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
+panic = "abort"
+
+# Match release panic strategy in dev too so behavior is consistent
+# when locally testing crash paths.
+[profile.dev]
+panic = "abort"

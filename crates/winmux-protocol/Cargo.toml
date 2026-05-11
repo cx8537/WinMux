@@ -1,0 +1,23 @@
+[package]
+name = "winmux-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared IPC message types and version constants for WinMux."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Wire format for every IPC message. `derive` powers the
+# Serialize/Deserialize macros used throughout.
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+# Idiomatic error enums for protocol-level errors.
+thiserror = { version = "1.0", default-features = false }
+
+[dev-dependencies]
+# JSON-Lines roundtrip tests. Production code does not depend on a
+# specific JSON encoder — `codec` accepts pre-encoded UTF-8 bytes — so
+# `serde_json` only lives in test builds.
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

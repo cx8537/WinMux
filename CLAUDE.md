@@ -12,6 +12,14 @@ Repository: <https://github.com/cx8537/WinMux>
 
 For full context, read `docs/spec/00-overview.md` before non-trivial work.
 
+## Language
+
+- All assistant responses to the user are written in **Korean (한국어)**.
+- Code, identifiers, commands, log output, and file paths stay in
+  their original form.
+- New code comments default to Korean; existing files follow whatever
+  comment language convention is already in place there.
+
 ## Absolute Rules — Do Not Violate
 
 1. **Never log PTY input/output content.** Names and metadata only.

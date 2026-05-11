@@ -10,7 +10,12 @@ cognitive-complexity-threshold = 30
 
 # Allow doc links to private items, since intra-crate docs are useful
 # without going through pub re-exports.
-allow-private-intra-doc-links = true
+#
+# 비활성화 이유: 현재 stable 채널의 clippy가 이 키를 인식하지 못하고
+# 알 수 없는 옵션으로 거부해 `cargo clippy`가 실패한다. 의도(비공개
+# 항목에 대한 intra-doc 링크 허용)는 stable에 도구가 다시 노출되면
+# 정확한 키 이름으로 되살린다.
+# allow-private-intra-doc-links = true
 
 # Permitted to use `print!` family of macros in these test/build paths
 # only. Production paths use tracing; see CLAUDE.md.

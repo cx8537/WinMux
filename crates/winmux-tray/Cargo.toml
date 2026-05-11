@@ -1,0 +1,34 @@
+[package]
+name = "winmux-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WinMux tray/GUI process glue. Tauri itself lives in src-tauri."
+
+[lints]
+workspace = true
+
+[lib]
+name = "winmux_tray"
+path = "src/lib.rs"
+
+[dependencies]
+winmux-protocol = { path = "../winmux-protocol" }
+
+# Async runtime. No PTY features — the tray is a Named Pipe client,
+# nothing more. Per CLAUDE.md Rule 11, no portable-pty, no
+# alacritty_terminal here.
+tokio = { version = "1.40", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "io-util",
+    "time",
+    "net",
+] }
+
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

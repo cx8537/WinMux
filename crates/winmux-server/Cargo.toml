@@ -1,0 +1,93 @@
+[package]
+name = "winmux-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WinMux background daemon: owns ConPTYs, scrollback, and the IPC server."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "winmux-server"
+path = "src/main.rs"
+
+[dependencies]
+winmux-protocol = { path = "../winmux-protocol" }
+
+# Async runtime. Specific features only; `full` is banned per
+# docs/conventions/coding-rust.md § Async.
+tokio = { version = "1.40", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "io-util",
+    "fs",
+    "time",
+    "net",
+    "process",
+    "signal",
+] }
+
+# Structured logging. The subscriber writes to a rolling file in
+# `%APPDATA%\winmux\logs\`; the appender provides the rotation.
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "std",
+    "fmt",
+    "env-filter",
+    "registry",
+    "ansi",
+] }
+tracing-appender = { version = "0.2", default-features = false }
+
+# `anyhow` only at the binary boundary; library modules use thiserror.
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+
+# ConPTY plumbing. `portable-pty` wraps `CreatePseudoConsole`,
+# handles the HPCON lifecycle, and exposes a stable cross-version API.
+portable-pty = { version = "0.8", default-features = false }
+
+# Virtual terminal state machine that backs the scrollback.
+alacritty_terminal = { version = "0.24", default-features = false }
+
+# Bundled SQLite for the audit log (`%APPDATA%\winmux\audit.sqlite`).
+# `bundled` avoids needing a system libsqlite3 on Windows.
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+
+# Win32 bindings: smallest feature set we need for ConPTY, Named
+# Pipes, Job Objects, security descriptors, and HKCU autostart.
+windows = { version = "0.58", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+# `winmux.toml` parsing.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+# Sortable IDs for sessions/windows/panes per docs/conventions/naming.md § IDs.
+ulid = { version = "1.1", default-features = false, features = ["std"] }
+
+# Timestamps for the audit log and session metadata. Chosen over
+# `chrono` because it has a smaller surface area, no `localtime_r`
+# soundness baggage, and we do not need chrono's broader formatter
+# ecosystem at this point.
+time = { version = "0.3", default-features = false, features = [
+    "std",
+    "formatting",
+    "macros",
+    "serde",
+] }

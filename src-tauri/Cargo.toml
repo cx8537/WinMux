@@ -1,0 +1,25 @@
+[package]
+name = "winmux-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tauri host binary for the WinMux tray; bundled into the NSIS installer."
+
+[lints]
+workspace = true
+
+[[bin]]
+# The output binary name matches docs/build/release.md § Build, which
+# expects `winmux-tray.exe` to ship inside the installer.
+name = "winmux-tray"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri runtime. Default features include `wry`, the WebView2 backend
+# we rely on for the Windows GUI.
+tauri = { version = "2", features = [] }
+winmux-tray = { path = "../crates/winmux-tray" }

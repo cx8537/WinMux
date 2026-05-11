@@ -1,0 +1,42 @@
+[package]
+name = "winmux-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Single-shot WinMux CLI client."
+
+[lints]
+workspace = true
+
+[[bin]]
+# Produces `winmux.exe` per docs/build/release.md § Build.
+name = "winmux"
+path = "src/main.rs"
+
+[dependencies]
+winmux-protocol = { path = "../winmux-protocol" }
+
+# Argument parsing. `derive` powers the structopt-style subcommand
+# enums we will define in src/args.rs.
+clap = { version = "4.5", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
+
+# Minimal Tokio for a single-shot pipe client: a current-thread
+# runtime, IO utilities, and net for the Named Pipe connect path.
+tokio = { version = "1.40", default-features = false, features = [
+    "rt",
+    "macros",
+    "io-util",
+    "net",
+    "time",
+] }
+
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

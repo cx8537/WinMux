@@ -1,0 +1,40 @@
+:root {
+  color-scheme: dark;
+}
+
+:root[data-theme='dark'] {
+  /* Surfaces */
+  --bg-primary: #1e1f22; /* main content area */
+  --bg-secondary: #2b2d30; /* sidebar, status bar, panels */
+  --bg-tertiary: #3c3f41; /* hover, input fields, code blocks */
+  --bg-active: #2e436e; /* selected items (IntelliJ blue) */
+  --bg-overlay: rgba(30, 31, 34, 0.85); /* modal backdrop */
+
+  /* Borders */
+  --border-subtle: #393b40; /* between panels */
+  --border-strong: #4e5157; /* input fields, dividers */
+  --border-focus: #4a88c7; /* focus ring */
+
+  /* Text */
+  --text-primary: #bcbec4; /* body text */
+  --text-secondary: #868a91; /* muted, labels, captions */
+  --text-disabled: #54585e; /* disabled controls */
+  --text-on-accent: #ffffff; /* text on accent-colored buttons */
+  --text-link: #4a88c7;
+  --text-link-hover: #5394d6;
+
+  /* Accent (interactive elements) */
+  --accent: #4a88c7; /* IntelliJ-style blue */
+  --accent-hover: #5394d6;
+  --accent-active: #3f77b0;
+
+  /* Pane borders */
+  --pane-border: #393b40;
+  --pane-border-active: #4a88c7;
+
+  /* Status signals — quiet by default */
+  --status-ok: #54a150; /* used sparingly */
+  --status-info: #4a88c7;
+  --status-warn: #c9a227;
+  --status-error: #c75450; /* IntelliJ error tone */
+}
