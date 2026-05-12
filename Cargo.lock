@@ -4992,6 +4992,7 @@ dependencies = [
  "tokio",
  "winmux-ipc-client",
  "winmux-protocol",
+ "winmux-server",
 ]
 
 [[package]]

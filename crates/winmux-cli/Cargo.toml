@@ -48,3 +48,19 @@ tokio = { version = "1.40", default-features = false, features = [
 
 anyhow = { version = "1.0", default-features = false, features = ["std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Integration tests run an in-process server (`winmux_server::pipe::run`)
+# and drive the cli handlers against it. The server crate is workspace-
+# local; tokio + anyhow are already present elsewhere — these are not
+# new dependencies, just made visible to test binaries.
+winmux-server = { path = "../winmux-server" }
+tokio = { version = "1.40", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "io-util",
+    "net",
+    "time",
+] }
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
