@@ -20,6 +20,10 @@ src-tauri/gen/
 !.vscode/extensions.json
 !.vscode/settings.shared.json
 
+# Claude Code: personal overrides (auto-mode allowlist, etc.).
+# Project-wide rules go in .claude/settings.json (committed).
+.claude/settings.local.json
+
 # OS
 Thumbs.db
 .DS_Store

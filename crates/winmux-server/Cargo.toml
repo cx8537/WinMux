@@ -9,6 +9,15 @@ description = "WinMux background daemon: owns ConPTYs, scrollback, and the IPC s
 [lints]
 workspace = true
 
+# Two-target layout: a library that holds the actual logic so that
+# integration tests under `tests/` can drive it directly, and a thin
+# binary that just invokes `run()`. This avoids spawning the real
+# `winmux-server.exe` in tests while still producing the daemon
+# executable for installers.
+[lib]
+name = "winmux_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "winmux-server"
 path = "src/main.rs"

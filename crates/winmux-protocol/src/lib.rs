@@ -25,4 +25,6 @@ pub use crate::types::{
     ClientKind, CommandRequest, CommandResultPayload, NewSessionRequest, PaneSize, PaneSummary,
     SelectDirection, SessionSummary, SplitDirection, WindowSummary,
 };
-pub use crate::version::{MAX_COMPATIBLE_VERSION, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION};
+pub use crate::version::{
+    MAX_COMPATIBLE_VERSION, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, is_compatible,
+};
