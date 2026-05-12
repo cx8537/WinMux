@@ -20,6 +20,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Tauri runtime. Default features include `wry`, the WebView2 backend
-# we rely on for the Windows GUI.
-tauri = { version = "2", features = [] }
+# we rely on for the Windows GUI. `tray-icon` enables the system tray
+# API used in `main.rs`.
+tauri = { version = "2", features = ["tray-icon"] }
 winmux-tray = { path = "../crates/winmux-tray" }
