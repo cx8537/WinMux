@@ -6,6 +6,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -15,7 +16,14 @@ use winmux_ipc_client::{Client, connect_with_retry};
 use winmux_protocol::{
     ClientKind, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerMessage, UserIdentity,
 };
+use winmux_server::jobobj::JobObject;
 use winmux_server::pipe;
+
+/// 통합 테스트마다 별도 Job Object를 만든다. spawn된 자식 셸은 그 Job에
+/// 부여되고, 테스트가 끝나면 Arc가 drop되어 모든 자식이 OS-레벨로 정리된다.
+fn fresh_job() -> Arc<JobObject> {
+    Arc::new(JobObject::create_kill_on_close().expect("create job object"))
+}
 
 /// 새 통합 시나리오마다 PID + 시각 prefix로 user_sha8을 만들어
 /// 동시 실행 시 파이프 이름이 충돌하지 않게 한다.
@@ -36,7 +44,9 @@ async fn hello_helloack_roundtrip_over_real_pipe() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_identity = identity.clone();
-    let server_task = tokio::spawn(async move { pipe::run(server_identity, shutdown_rx).await });
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
 
     let pipe = connect_with_retry(&pipe_name)
         .await
@@ -67,7 +77,9 @@ async fn non_hello_first_message_is_rejected_over_real_pipe() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_identity = identity.clone();
-    let server_task = tokio::spawn(async move { pipe::run(server_identity, shutdown_rx).await });
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
 
     let pipe = connect_with_retry(&pipe_name)
         .await
@@ -105,7 +117,9 @@ async fn ping_returns_pong_with_same_id() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_identity = identity.clone();
-    let server_task = tokio::spawn(async move { pipe::run(server_identity, shutdown_rx).await });
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
 
     let pipe = connect_with_retry(&pipe_name).await.context("connect")?;
     let mut client = Client::new(pipe);
@@ -142,7 +156,9 @@ async fn list_sessions_returns_empty_in_m0() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_identity = identity.clone();
-    let server_task = tokio::spawn(async move { pipe::run(server_identity, shutdown_rx).await });
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
 
     let pipe = connect_with_retry(&pipe_name).await.context("connect")?;
     let mut client = Client::new(pipe);

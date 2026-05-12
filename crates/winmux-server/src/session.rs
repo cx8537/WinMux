@@ -21,6 +21,8 @@ use winmux_protocol::{
     SessionSummary, WindowId, WindowSummary,
 };
 
+use crate::pty::Pty;
+
 /// 패널 한 개 분량의 메타데이터(ConPTY 미통합 stub 포함).
 #[derive(Clone, Debug)]
 pub struct PaneState {
@@ -128,11 +130,24 @@ pub struct AttachResult {
     pub panes: Vec<PaneSummary>,
 }
 
+/// 한 패널의 런타임 자원. 메타데이터([`PaneState`])와 동일한 lifecycle.
+pub struct PaneRuntime {
+    /// 와이어 식별자.
+    pub pane_id: PaneId,
+    /// 소속 윈도우.
+    pub window_id: WindowId,
+    /// 소속 세션.
+    pub session_id: SessionId,
+    /// 셸의 PTY. `Arc`로 broadcast subscriber와 writer가 공유한다.
+    pub pty: Arc<Pty>,
+}
+
 /// 세션 in-memory 저장소. 단일 server 프로세스 안에서 공유된다.
 pub struct Registry {
     sessions: HashMap<SessionId, SessionState>,
     name_index: HashMap<String, SessionId>,
     untitled_counter: u32,
+    pane_runtimes: HashMap<PaneId, PaneRuntime>,
 }
 
 impl Default for Registry {
@@ -149,6 +164,7 @@ impl Registry {
             sessions: HashMap::new(),
             name_index: HashMap::new(),
             untitled_counter: 0,
+            pane_runtimes: HashMap::new(),
         }
     }
 
@@ -201,8 +217,8 @@ impl Registry {
         Ok(session_id)
     }
 
-    /// 세션을 종료한다. 어태치되어 있던 클라이언트는 caller가 자기 task에서
-    /// 정리한다 (push 이벤트는 후속 단계).
+    /// 세션을 종료한다. 등록되어 있던 모든 [`PaneRuntime`]은 함께 drop되어
+    /// `Pty` Drop으로 자식이 정리된다.
     pub fn kill_session(&mut self, target: &KillSessionTarget) -> Result<SessionId, RegistryError> {
         let id = self
             .resolve_kill_target(target)
@@ -212,7 +228,106 @@ impl Registry {
             .remove(&id)
             .ok_or_else(|| RegistryError::SessionNotFound(id.to_string()))?;
         self.name_index.remove(&session.name);
+        // 메타데이터 제거 후 runtime도 제거 → Pty Drop → 자식 kill.
+        for window in &session.windows {
+            for pane in &window.panes {
+                self.pane_runtimes.remove(&pane.id);
+            }
+        }
         Ok(id)
+    }
+
+    /// 사전에 만들어진 [`PaneRuntime`]을 첫 패널로 가진 세션을 등록한다.
+    ///
+    /// 호출자는 [`new_session_id`]·[`new_window_id`]·[`new_pane_id`]로 미리 ID를
+    /// 만들고 [`Pty::spawn`]을 끝낸 뒤 본 함수를 호출한다. 등록이 실패하면
+    /// 호출자가 받은 `runtime`(즉 PTY)을 그대로 drop해서 자식을 정리한다.
+    pub fn create_session_with_runtime(
+        &mut self,
+        req: &NewSessionRequest,
+        size: PaneSize,
+        runtime: PaneRuntime,
+    ) -> Result<(SessionId, PaneId), RegistryError> {
+        let name = match req.name.clone() {
+            Some(n) if !n.is_empty() => {
+                if self.name_index.contains_key(&n) {
+                    return Err(RegistryError::NameTaken(n));
+                }
+                n
+            }
+            _ => self.next_untitled_name(),
+        };
+
+        let session_id = runtime.session_id.clone();
+        let window_id = runtime.window_id.clone();
+        let pane_id = runtime.pane_id.clone();
+
+        let pane = PaneState {
+            id: pane_id.clone(),
+            index: 0,
+            size,
+            title: None,
+            // 실제 셸이 PTY로 살아있으므로 alive.
+            alive: true,
+        };
+
+        let window = WindowState {
+            id: window_id.clone(),
+            index: 0,
+            name: None,
+            active_pane: pane_id.clone(),
+            panes: vec![pane],
+        };
+
+        let session = SessionState {
+            id: session_id.clone(),
+            name: name.clone(),
+            created_at: now_rfc3339(),
+            windows: vec![window],
+            active_window: window_id,
+            attached_clients: 0,
+        };
+
+        self.sessions.insert(session_id.clone(), session);
+        self.name_index.insert(name, session_id.clone());
+        self.pane_runtimes.insert(pane_id.clone(), runtime);
+        Ok((session_id, pane_id))
+    }
+
+    /// 한 패널의 PTY 핸들을 [`Arc`]로 빌려준다(있으면).
+    #[must_use]
+    pub fn pty_for_pane(&self, pane_id: &PaneId) -> Option<Arc<Pty>> {
+        self.pane_runtimes.get(pane_id).map(|r| r.pty.clone())
+    }
+
+    /// 한 세션의 모든 (패널-ID, PTY) 쌍을 모은다 — broadcast forwarder 등록에 쓴다.
+    #[must_use]
+    pub fn ptys_for_session(&self, session_id: &SessionId) -> Vec<(PaneId, Arc<Pty>)> {
+        let Some(session) = self.sessions.get(session_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for window in &session.windows {
+            for pane in &window.panes {
+                if let Some(rt) = self.pane_runtimes.get(&pane.id) {
+                    out.push((pane.id.clone(), rt.pty.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// 한 패널의 메타 size를 갱신한다(`Resize` 메시지 dispatch 시).
+    pub fn update_pane_size(&mut self, pane_id: &PaneId, size: PaneSize) -> bool {
+        for session in self.sessions.values_mut() {
+            for window in &mut session.windows {
+                if let Some(pane) = window.panes.iter_mut().find(|p| &p.id == pane_id) {
+                    pane.size = size;
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// 모든 세션을 와이어용 요약으로 변환.

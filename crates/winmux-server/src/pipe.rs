@@ -18,21 +18,29 @@ pub mod security;
 pub use handshake::AuthenticatedClient;
 pub use security::PipeAcl;
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufStream};
 use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use winmux_protocol::{
-    ClientMessage, ErrorCode, MessageId, PROTOCOL_VERSION, ServerMessage, SessionId, UserIdentity,
-    decode_line,
+    AttachTarget, ClientMessage, ErrorCode, EventMessage, MessageId, NewSessionRequest,
+    PROTOCOL_VERSION, PaneId, PaneSize, ServerMessage, SessionId, UserIdentity, codec, decode_line,
 };
 
+use crate::jobobj::JobObject;
 use crate::pipe::handshake::{perform_handshake, send_error_message, send_server_message};
 use crate::pipe::security::verify_client_user;
-use crate::session::{Registry, RegistryError, SharedRegistry};
+use crate::pty::{Pty, PtyEvent, SpawnRequest};
+use crate::session::{
+    PaneRuntime, Registry, RegistryError, SharedRegistry, new_pane_id, new_session_id,
+    new_window_id,
+};
 
 /// 단일 파이프 인스턴스당 커널 in/out 버퍼 hint(바이트).
 const PIPE_IN_BUF: u32 = 64 * 1024;
@@ -42,12 +50,25 @@ const PIPE_OUT_BUF: u32 = 64 * 1024;
 /// (Win32의 `PIPE_UNLIMITED_INSTANCES=255`는 매직 값으로 별도 처리됨).
 const PIPE_MAX_INSTANCES: usize = 254;
 
+/// 새 패널의 기본 셀 크기. 첫 Attach에서 클라이언트가 자기 크기로 `Resize`를
+/// 보낼 때까지 임시로 쓴다.
+const DEFAULT_PANE_ROWS: u16 = 40;
+const DEFAULT_PANE_COLS: u16 = 120;
+
+/// 한 클라이언트가 받을 수 있는 outgoing 메시지 큐. PtyOutput · push 이벤트 ·
+/// 응답이 모두 이 채널을 통한다.
+const CLIENT_OUTBOX_CAPACITY: usize = 256;
+
 /// accept 루프 진입점.
 ///
 /// 한 번에 하나씩 새 파이프 인스턴스를 만들고, 한 클라이언트를 받으면
 /// 핸들러 task로 분리한 뒤 다음 인스턴스를 만든다. `shutdown_rx`가
 /// 신호를 받으면 즉시 종료한다 (반쯤 만들어진 인스턴스는 Drop으로 정리됨).
-pub async fn run(identity: UserIdentity, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
+pub async fn run(
+    identity: UserIdentity,
+    job: Arc<JobObject>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> Result<()> {
     let acl = PipeAcl::build_for_current_user().context("build pipe security descriptor")?;
     let pipe_name = identity.pipe_name();
     info!(pipe = %pipe_name, "ipc.listening");
@@ -79,8 +100,9 @@ pub async fn run(identity: UserIdentity, mut shutdown_rx: oneshot::Receiver<()>)
                 }
                 let username = identity.username.clone();
                 let registry = registry.clone();
+                let job = job.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(server, username, registry).await {
+                    if let Err(e) = handle_client(server, username, registry, job).await {
                         warn!(error = %e, "client.handler.failed");
                     }
                 });
@@ -119,20 +141,25 @@ enum DispatchOutcome {
     Disconnect,
 }
 
-/// `attached_clients` 카운트를 보장 감소시키는 RAII 가드.
+/// `attached_clients` 카운트와 broadcast forwarder들의 lifecycle을 함께 묶는
+/// RAII 가드.
 ///
 /// 한 클라이언트 task가 attach한 세션을 추적해서, 명시적 `Detach`·`Bye`·
-/// 비정상 disconnect 어느 경로로 끝나든 [`Registry::detach`]가 정확히
-/// 한 번 호출되도록 한다.
+/// 비정상 disconnect 어느 경로로 끝나든 (1) [`Registry::detach`]가 정확히
+/// 한 번 호출되고 (2) 그 세션의 PTY broadcast forwarder task들이 abort된다.
 struct AttachGuard {
     registry: SharedRegistry,
     session_id: SessionId,
+    forwarders: Vec<JoinHandle<()>>,
 }
 
 impl Drop for AttachGuard {
     fn drop(&mut self) {
         let mut reg = lock_registry(&self.registry);
         reg.detach(&self.session_id);
+        for h in &self.forwarders {
+            h.abort();
+        }
     }
 }
 
@@ -141,11 +168,19 @@ fn lock_registry(reg: &SharedRegistry) -> std::sync::MutexGuard<'_, Registry> {
     reg.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 클라이언트 핸들러: 핸드셰이크 → 메시지 dispatch.
+/// dispatcher와 broadcast forwarder들이 공유하는 상수 컨텍스트.
+struct ClientContext {
+    registry: SharedRegistry,
+    job: Arc<JobObject>,
+    forward_tx: mpsc::Sender<ServerMessage>,
+}
+
+/// 클라이언트 핸들러: 핸드셰이크 → 메시지 dispatch + PtyOutput/이벤트 forward.
 async fn handle_client(
     server: NamedPipeServer,
     username: String,
     registry: SharedRegistry,
+    job: Arc<JobObject>,
 ) -> Result<()> {
     let mut stream = BufStream::new(server);
     let auth = perform_handshake(&mut stream, &username).await?;
@@ -157,16 +192,35 @@ async fn handle_client(
         "client.session.start"
     );
 
-    let mut attach: Option<AttachGuard> = None;
+    let (forward_tx, mut forward_rx) = mpsc::channel::<ServerMessage>(CLIENT_OUTBOX_CAPACITY);
+    let ctx = ClientContext {
+        registry,
+        job,
+        forward_tx,
+    };
 
+    let mut attach: Option<AttachGuard> = None;
     let mut buf = Vec::with_capacity(512);
+
     loop {
         buf.clear();
-        let n = stream.read_until(b'\n', &mut buf).await.context("read")?;
-        if n == 0 {
-            debug!("client.eof");
-            break;
+        // `read_until` cancel-safety: 부분 누적 데이터는 buf에 남고 다음 iteration에서
+        // 이어서 읽는다. `forward_rx.recv()` 분기는 stream을 빌리지 않으므로 충돌 없다.
+        tokio::select! {
+            biased;
+            Some(out_msg) = forward_rx.recv() => {
+                send_server_message(&mut stream, &out_msg).await?;
+                continue;
+            }
+            read_res = stream.read_until(b'\n', &mut buf) => {
+                let n = read_res.context("read")?;
+                if n == 0 {
+                    debug!("client.eof");
+                    break;
+                }
+            }
         }
+
         let body = match decode_line(&buf) {
             Ok(b) => b,
             Err(e) => {
@@ -197,24 +251,21 @@ async fn handle_client(
                 continue;
             }
         };
-        match dispatch_message(&mut stream, &registry, &mut attach, msg).await? {
+        match dispatch_message(&mut stream, &ctx, &mut attach, msg).await? {
             DispatchOutcome::Continue => {}
             DispatchOutcome::Disconnect => break,
         }
     }
 
-    // attach Drop이 카운터를 -1 해준다.
+    // attach Drop이 detach 카운트와 forwarder 정리를 모두 처리한다.
     info!(client = ?auth.client_kind, "client.session.end");
     Ok(())
 }
 
 /// 핸드셰이크 이후 들어온 한 메시지를 처리한다.
-///
-/// `attach`는 현재 클라이언트가 어태치한 세션을 추적한다. 새 어태치 또는
-/// 디태치 시점에 갱신되어 Drop이 카운터를 정리하게 한다.
 async fn dispatch_message<S>(
     stream: &mut BufStream<S>,
-    registry: &SharedRegistry,
+    ctx: &ClientContext,
     attach: &mut Option<AttachGuard>,
     msg: ClientMessage,
 ) -> Result<DispatchOutcome>
@@ -249,7 +300,7 @@ where
             Ok(DispatchOutcome::Disconnect)
         }
         ClientMessage::ListSessions { id, .. } => {
-            let sessions = lock_registry(registry).list_summaries();
+            let sessions = lock_registry(&ctx.registry).list_summaries();
             let resp = ServerMessage::SessionList {
                 v: PROTOCOL_VERSION,
                 id,
@@ -259,15 +310,14 @@ where
             Ok(DispatchOutcome::Continue)
         }
         ClientMessage::NewSession { id, request, .. } => {
-            handle_new_session(stream, registry, attach, id, request).await?;
+            handle_new_session(stream, ctx, attach, id, request).await?;
             Ok(DispatchOutcome::Continue)
         }
         ClientMessage::Attach { id, session, .. } => {
-            handle_attach(stream, registry, attach, id, session).await?;
+            handle_attach(stream, ctx, attach, id, session).await?;
             Ok(DispatchOutcome::Continue)
         }
         ClientMessage::Detach { id, .. } => {
-            // attach Drop이 카운터를 -1 한다.
             *attach = None;
             let resp = ServerMessage::Ok {
                 v: PROTOCOL_VERSION,
@@ -277,13 +327,10 @@ where
             Ok(DispatchOutcome::Continue)
         }
         ClientMessage::KillSession { id, session, .. } => {
-            let result = lock_registry(registry).kill_session(&session);
+            let result = lock_registry(&ctx.registry).kill_session(&session);
             match result {
                 Ok(killed_id) => {
                     info!(session = %killed_id, "session.killed");
-                    // 이 클라이언트가 그 세션에 어태치되어 있었다면 attach guard가
-                    // 살아있는 동안 Drop은 detach를 호출하지만 세션은 이미 제거되어
-                    // no-op. 명시적으로 우리 attach를 비워둔다.
                     if let Some(g) = attach.as_ref()
                         && g.session_id == killed_id
                     {
@@ -312,8 +359,22 @@ where
             }
             Ok(DispatchOutcome::Continue)
         }
-        ClientMessage::PtyInput { .. } => {
-            debug!("client.pty_input.discarded");
+        ClientMessage::PtyInput {
+            pane_id,
+            bytes_base64,
+            ..
+        } => {
+            handle_pty_input(&ctx.registry, &pane_id, &bytes_base64).await;
+            Ok(DispatchOutcome::Continue)
+        }
+        ClientMessage::Resize {
+            id,
+            pane_id,
+            rows,
+            cols,
+            ..
+        } => {
+            handle_resize(stream, &ctx.registry, id, pane_id, rows, cols).await?;
             Ok(DispatchOutcome::Continue)
         }
         other => {
@@ -332,21 +393,76 @@ where
     }
 }
 
-/// `NewSession` 분기. 생성 성공 후 detached가 아니면 자동 어태치.
+/// `NewSession` 분기. 실제 셸을 spawn해 PaneRuntime을 만든 뒤 메타데이터를
+/// 등록한다. detached가 아니면 본 클라이언트를 그 세션에 자동 어태치한다.
 async fn handle_new_session<S>(
     stream: &mut BufStream<S>,
-    registry: &SharedRegistry,
+    ctx: &ClientContext,
     attach: &mut Option<AttachGuard>,
     request_id: MessageId,
-    request: winmux_protocol::NewSessionRequest,
+    request: NewSessionRequest,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let detached = request.detached;
-    let create_result = lock_registry(registry).create_session(&request);
-    let new_id = match create_result {
-        Ok(id) => id,
+
+    // 1) ID를 미리 만들어 spawn 호출 결과와 묶을 준비.
+    let session_id = new_session_id();
+    let window_id = new_window_id();
+    let pane_id = new_pane_id();
+
+    // 2) 셸·환경 결정.
+    let shell = resolve_shell(&request);
+    let cwd = request
+        .cwd
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let env = build_env(&request, &session_id);
+
+    // 3) Pty::spawn — 실패 시 메타데이터 등록조차 시도하지 않는다.
+    let spawn_req = SpawnRequest {
+        shell,
+        args: Vec::new(),
+        cwd,
+        env,
+        rows: DEFAULT_PANE_ROWS,
+        cols: DEFAULT_PANE_COLS,
+    };
+    let pty = match Pty::spawn(spawn_req, Some(&ctx.job)) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            warn!(error = ?e, "session.spawn.failed");
+            send_error_message(
+                stream,
+                Some(request_id),
+                ErrorCode::Internal,
+                &format!("spawn failed: {e}"),
+                true,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let runtime = PaneRuntime {
+        pane_id: pane_id.clone(),
+        window_id: window_id.clone(),
+        session_id: session_id.clone(),
+        pty,
+    };
+
+    // 4) Registry 등록 — 실패 시 runtime drop → Pty drop → 자식 kill로 정리.
+    let create_result = lock_registry(&ctx.registry).create_session_with_runtime(
+        &request,
+        PaneSize {
+            rows: DEFAULT_PANE_ROWS,
+            cols: DEFAULT_PANE_COLS,
+        },
+        runtime,
+    );
+    let created = match create_result {
+        Ok((sid, _pid)) => sid,
         Err(e) => {
             warn!(error = %e, "session.new_session.failed");
             let code = match e {
@@ -357,7 +473,7 @@ where
             return Ok(());
         }
     };
-    info!(session = %new_id, detached, "session.created");
+    info!(session = %created, detached, "session.created");
 
     if detached {
         let resp = ServerMessage::Ok {
@@ -368,14 +484,17 @@ where
         return Ok(());
     }
 
-    // 자동 어태치.
-    let attach_result =
-        lock_registry(registry).attach(&winmux_protocol::AttachTarget::Id { id: new_id.clone() });
+    // 5) 자동 어태치 + broadcast forwarder.
+    let attach_result = lock_registry(&ctx.registry).attach(&AttachTarget::Id {
+        id: created.clone(),
+    });
     match attach_result {
         Ok(a) => {
+            let forwarders = spawn_forwarders(&ctx.registry, &a.session_id, &ctx.forward_tx);
             *attach = Some(AttachGuard {
-                registry: registry.clone(),
+                registry: ctx.registry.clone(),
                 session_id: a.session_id.clone(),
+                forwarders,
             });
             let resp = ServerMessage::Attached {
                 v: PROTOCOL_VERSION,
@@ -384,6 +503,7 @@ where
                 active_window: a.active_window,
                 windows: a.windows,
                 panes: a.panes,
+                // alacritty_terminal-based snapshot은 후속 단계.
                 initial_snapshots: Vec::new(),
             };
             send_server_message(stream, &resp).await?;
@@ -405,21 +525,24 @@ where
 /// `Attach` 분기.
 async fn handle_attach<S>(
     stream: &mut BufStream<S>,
-    registry: &SharedRegistry,
+    ctx: &ClientContext,
     attach: &mut Option<AttachGuard>,
     request_id: MessageId,
-    target: winmux_protocol::AttachTarget,
+    target: AttachTarget,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let result = lock_registry(registry).attach(&target);
+    let result = lock_registry(&ctx.registry).attach(&target);
     match result {
         Ok(a) => {
-            // 이전 어태치는 새 guard를 대입하기 전에 Drop된다.
+            // 이전 attach guard를 먼저 drop해 그쪽 forwarder들이 abort되도록 한다.
+            *attach = None;
+            let forwarders = spawn_forwarders(&ctx.registry, &a.session_id, &ctx.forward_tx);
             *attach = Some(AttachGuard {
-                registry: registry.clone(),
+                registry: ctx.registry.clone(),
                 session_id: a.session_id.clone(),
+                forwarders,
             });
             let resp = ServerMessage::Attached {
                 v: PROTOCOL_VERSION,
@@ -454,6 +577,157 @@ where
         }
     }
     Ok(())
+}
+
+/// `PtyInput` 분기 — 응답 없는 streaming. 알 수 없는 패널이면 조용히 무시.
+async fn handle_pty_input(registry: &SharedRegistry, pane_id: &PaneId, bytes_base64: &str) {
+    let bytes = match codec::base64_decode(bytes_base64) {
+        Ok(b) => b,
+        Err(e) => {
+            debug!(error = %e, %pane_id, "client.pty_input.invalid_base64");
+            return;
+        }
+    };
+    let pty = lock_registry(registry).pty_for_pane(pane_id);
+    if let Some(pty) = pty {
+        if let Err(e) = pty.write_input(bytes).await {
+            warn!(error = %e, %pane_id, "pty.input.write_failed");
+        }
+    } else {
+        debug!(%pane_id, "pty_input.unknown_pane");
+    }
+}
+
+/// `Resize` 분기 — master.resize + 메타 size 갱신.
+async fn handle_resize<S>(
+    stream: &mut BufStream<S>,
+    registry: &SharedRegistry,
+    request_id: MessageId,
+    pane_id: PaneId,
+    rows: u16,
+    cols: u16,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let pty = lock_registry(registry).pty_for_pane(&pane_id);
+    let Some(pty) = pty else {
+        send_error_message(
+            stream,
+            Some(request_id),
+            ErrorCode::PaneNotFound,
+            "pane not found",
+            true,
+        )
+        .await;
+        return Ok(());
+    };
+    match pty.try_resize(rows, cols) {
+        Ok(()) => {
+            lock_registry(registry).update_pane_size(&pane_id, PaneSize { rows, cols });
+            let resp = ServerMessage::Ok {
+                v: PROTOCOL_VERSION,
+                id: request_id,
+            };
+            send_server_message(stream, &resp).await?;
+        }
+        Err(e) => {
+            warn!(error = %e, %pane_id, "pty.resize.failed");
+            send_error_message(
+                stream,
+                Some(request_id),
+                ErrorCode::Internal,
+                &format!("resize failed: {e}"),
+                true,
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// 한 세션의 모든 패널에 대해 `PtyEvent → ServerMessage` 변환 task를 띄운다.
+fn spawn_forwarders(
+    registry: &SharedRegistry,
+    session_id: &SessionId,
+    forward_tx: &mpsc::Sender<ServerMessage>,
+) -> Vec<JoinHandle<()>> {
+    let ptys = lock_registry(registry).ptys_for_session(session_id);
+    let mut handles = Vec::with_capacity(ptys.len());
+    for (pane_id, pty) in ptys {
+        let rx = pty.subscribe();
+        let tx = forward_tx.clone();
+        handles.push(tokio::spawn(async move {
+            forward_pane_events(pane_id, rx, tx).await;
+        }));
+    }
+    handles
+}
+
+async fn forward_pane_events(
+    pane_id: PaneId,
+    mut rx: broadcast::Receiver<PtyEvent>,
+    forward_tx: mpsc::Sender<ServerMessage>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(PtyEvent::Output(bytes)) => {
+                let msg = ServerMessage::PtyOutput {
+                    v: PROTOCOL_VERSION,
+                    pane_id: pane_id.clone(),
+                    bytes_base64: codec::base64_encode(&bytes),
+                };
+                if forward_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            Ok(PtyEvent::Exited { code }) => {
+                let msg = ServerMessage::Event {
+                    v: PROTOCOL_VERSION,
+                    event: EventMessage::PaneExited {
+                        v: PROTOCOL_VERSION,
+                        pane_id: pane_id.clone(),
+                        exit_code: code.unwrap_or(-1),
+                    },
+                };
+                let _ = forward_tx.send(msg).await;
+                break;
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(dropped = n, %pane_id, "client.broadcast.lagged");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// 셸 결정: 명시 → `COMSPEC` → `powershell.exe`. spec § Default shell의
+/// 우선순위 1(winmux.toml) / 2(.tmux.conf)는 설정 모듈이 들어온 뒤 추가.
+fn resolve_shell(req: &NewSessionRequest) -> PathBuf {
+    if let Some(s) = &req.shell
+        && !s.is_empty()
+    {
+        return PathBuf::from(s);
+    }
+    if let Ok(comspec) = std::env::var("COMSPEC")
+        && !comspec.is_empty()
+    {
+        return PathBuf::from(comspec);
+    }
+    PathBuf::from("powershell.exe")
+}
+
+/// spec § Environment의 정적 `WINMUX_*` 변수 + spawn 시 추가 env.
+fn build_env(req: &NewSessionRequest, session_id: &SessionId) -> BTreeMap<String, String> {
+    let mut env = req.env.clone();
+    env.insert(
+        "WINMUX_VERSION".to_owned(),
+        env!("CARGO_PKG_VERSION").to_owned(),
+    );
+    env.insert("WINMUX_SESSION_ID".to_owned(), session_id.to_string());
+    env.insert("WINMUX_WINDOW_INDEX".to_owned(), "0".to_owned());
+    env.insert("WINMUX_PANE_INDEX".to_owned(), "0".to_owned());
+    env
 }
 
 /// 메시지의 `id` 필드를 추출한다. 스트리밍 메시지(`Bye`, `PtyInput`)는 `None`.

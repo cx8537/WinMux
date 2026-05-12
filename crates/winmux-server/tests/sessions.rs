@@ -7,6 +7,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,7 +18,12 @@ use winmux_protocol::{
     AttachTarget, ClientKind, ClientMessage, ErrorCode, KillSessionTarget, NewSessionRequest,
     PROTOCOL_VERSION, ServerMessage, UserIdentity,
 };
+use winmux_server::jobobj::JobObject;
 use winmux_server::pipe;
+
+fn fresh_job() -> Arc<JobObject> {
+    Arc::new(JobObject::create_kill_on_close().expect("create job object"))
+}
 
 fn unique_username(tag: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,7 +52,9 @@ async fn new_session_then_list_returns_one() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_identity = identity.clone();
-    let server_task = tokio::spawn(async move { pipe::run(server_identity, shutdown_rx).await });
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
 
     let pipe = connect_with_retry(&pipe_name).await.context("connect")?;
     let mut client = Client::new(pipe);
@@ -103,7 +111,9 @@ async fn new_session_auto_attaches_and_disconnect_decrements() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_identity = identity.clone();
-    let server_task = tokio::spawn(async move { pipe::run(server_identity, shutdown_rx).await });
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
 
     // 첫 클라이언트는 NewSession을 자동 어태치로 생성.
     let pipe1 = connect_with_retry(&pipe_name).await.context("connect")?;
@@ -132,7 +142,7 @@ async fn new_session_auto_attaches_and_disconnect_decrements() -> Result<()> {
             assert_eq!(id, create_id);
             assert_eq!(windows.len(), 1);
             assert_eq!(panes.len(), 1);
-            assert!(!panes[0].alive, "placeholder pane is dead until ConPTY");
+            assert!(panes[0].alive, "ConPTY-backed pane should be alive");
             assert!(initial_snapshots.is_empty());
             session_id
         }
@@ -218,7 +228,9 @@ async fn kill_session_removes_it_and_unknown_target_errors() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_identity = identity.clone();
-    let server_task = tokio::spawn(async move { pipe::run(server_identity, shutdown_rx).await });
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
 
     let pipe = connect_with_retry(&pipe_name).await.context("connect")?;
     let mut client = Client::new(pipe);
@@ -297,7 +309,9 @@ async fn attach_to_existing_session_by_name() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_identity = identity.clone();
-    let server_task = tokio::spawn(async move { pipe::run(server_identity, shutdown_rx).await });
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
 
     // 첫 클라이언트가 detached로 세션을 만든다.
     let pipe1 = connect_with_retry(&pipe_name).await.context("connect")?;

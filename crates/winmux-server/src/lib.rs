@@ -8,15 +8,21 @@
 //! 모듈 책임 분리는 `docs/spec/00-overview.md` § Three Processes 의
 //! "server" 컬럼과 1:1 대응한다.
 
+pub mod jobobj;
 pub mod logging;
 pub mod pipe;
+pub mod pty;
 pub mod session;
 pub mod single_instance;
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 use winmux_protocol::UserIdentity;
+
+use crate::jobobj::JobObject;
 
 /// 동기 entry. 로깅 init과 Tokio 런타임 빌드까지 책임진다.
 ///
@@ -57,6 +63,9 @@ pub async fn run_async() -> Result<()> {
         "server.starting"
     );
 
+    // server-wide Job Object: server.exe 종료 시 모든 자식 셸이 함께 정리된다.
+    let job = Arc::new(JobObject::create_kill_on_close().context("create server-wide Job Object")?);
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let signal_task = tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
@@ -70,7 +79,7 @@ pub async fn run_async() -> Result<()> {
         }
     });
 
-    let pipe_result = pipe::run(identity, shutdown_rx).await;
+    let pipe_result = pipe::run(identity, job, shutdown_rx).await;
     signal_task.abort();
     // signal_task가 abort 후에는 JoinError(Cancelled)만 돌아오므로 결과 무시.
     let _ = signal_task.await;
