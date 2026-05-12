@@ -19,15 +19,15 @@ pub use handshake::AuthenticatedClient;
 pub use security::PipeAcl;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, BufStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufStream};
 use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
-use winmux_protocol::{ClientMessage, decode_line};
+use winmux_protocol::{
+    ClientMessage, ErrorCode, MessageId, PROTOCOL_VERSION, ServerMessage, UserIdentity, decode_line,
+};
 
-use winmux_protocol::UserIdentity;
-
-use crate::pipe::handshake::perform_handshake;
+use crate::pipe::handshake::{perform_handshake, send_error_message, send_server_message};
 use crate::pipe::security::verify_client_user;
 
 /// 단일 파이프 인스턴스당 커널 in/out 버퍼 hint(바이트).
@@ -102,10 +102,23 @@ fn make_server_instance(name: &str, acl: &PipeAcl, first: bool) -> Result<NamedP
     Ok(server)
 }
 
-/// 클라이언트 핸들러: 핸드셰이크 → 메시지 수신 (M0 skeleton).
+/// 디스패처의 다음 행동.
+enum DispatchOutcome {
+    /// 다음 메시지를 계속 읽는다.
+    Continue,
+    /// `Bye` 등으로 정상 종료. 루프를 빠져나간다.
+    Disconnect,
+}
+
+/// 클라이언트 핸들러: 핸드셰이크 → 메시지 dispatch (M0 단계 응답).
 ///
-/// M0 skeleton 단계에서는 HelloAck 이후 들어오는 메시지를 파싱만 하고
-/// `Bye`까지 기다린다. 본격 dispatcher는 후속 작업에서 추가한다.
+/// 현재 응답 가능한 메시지:
+/// - `Hello` (이미 인증된 상태에서 두 번째 Hello → `PROTOCOL_VIOLATION`)
+/// - `Ping` → `Pong`
+/// - `Bye` → 응답 없이 연결 종료
+/// - `ListSessions` → `SessionList`(현재는 빈 배열 — 세션 모델은 다음 단계)
+/// - `PtyInput` → 조용히 무시 (세션 dispatcher 부재)
+/// - 그 외 → `Error { code: INTERNAL, recoverable: true }` 후 계속
 async fn handle_client(server: NamedPipeServer, username: String) -> Result<()> {
     let mut stream = BufStream::new(server);
     let auth = perform_handshake(&mut stream, &username).await?;
@@ -129,25 +142,129 @@ async fn handle_client(server: NamedPipeServer, username: String) -> Result<()> 
             Ok(b) => b,
             Err(e) => {
                 warn!(error = %e, "client.frame.invalid");
+                send_error_message(
+                    &mut stream,
+                    None,
+                    ErrorCode::ProtocolViolation,
+                    &format!("frame error: {e}"),
+                    true,
+                )
+                .await;
                 continue;
             }
         };
-        match serde_json::from_str::<ClientMessage>(body) {
-            Ok(ClientMessage::Bye { .. }) => {
-                info!("client.bye");
-                break;
-            }
-            Ok(other) => {
-                debug!(message_type = %message_type_name(&other), "client.message.received");
-            }
+        let msg = match serde_json::from_str::<ClientMessage>(body) {
+            Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, "client.message.invalid");
+                send_error_message(
+                    &mut stream,
+                    None,
+                    ErrorCode::ProtocolViolation,
+                    &format!("deserialize failed: {e}"),
+                    true,
+                )
+                .await;
+                continue;
             }
+        };
+        match dispatch_message(&mut stream, msg).await? {
+            DispatchOutcome::Continue => {}
+            DispatchOutcome::Disconnect => break,
         }
     }
 
     info!(client = ?auth.client_kind, "client.session.end");
     Ok(())
+}
+
+/// 핸드셰이크 이후 들어온 한 메시지를 처리한다.
+async fn dispatch_message<S>(
+    stream: &mut BufStream<S>,
+    msg: ClientMessage,
+) -> Result<DispatchOutcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let type_name = message_type_name(&msg);
+    debug!(message_type = %type_name, "client.message.received");
+
+    match msg {
+        ClientMessage::Hello { id, .. } => {
+            // 이미 Authenticated 상태에서 또 Hello — 위반.
+            send_error_message(
+                stream,
+                Some(id),
+                ErrorCode::ProtocolViolation,
+                "Hello already completed for this connection",
+                false,
+            )
+            .await;
+            Ok(DispatchOutcome::Disconnect)
+        }
+        ClientMessage::Ping { id, .. } => {
+            let pong = ServerMessage::Pong {
+                v: PROTOCOL_VERSION,
+                id,
+            };
+            send_server_message(stream, &pong).await?;
+            Ok(DispatchOutcome::Continue)
+        }
+        ClientMessage::Bye { .. } => {
+            info!("client.bye");
+            Ok(DispatchOutcome::Disconnect)
+        }
+        ClientMessage::ListSessions { id, .. } => {
+            // 세션 모델은 다음 단계 — 현재는 빈 배열을 돌려준다.
+            let resp = ServerMessage::SessionList {
+                v: PROTOCOL_VERSION,
+                id,
+                sessions: Vec::new(),
+            };
+            send_server_message(stream, &resp).await?;
+            Ok(DispatchOutcome::Continue)
+        }
+        ClientMessage::PtyInput { .. } => {
+            // 스트리밍 입력은 응답 없는 메시지. 세션 dispatcher가 없는 동안 조용히 무시.
+            debug!("client.pty_input.discarded");
+            Ok(DispatchOutcome::Continue)
+        }
+        other => {
+            let request_id = client_message_id(&other);
+            warn!(message_type = %type_name, "client.message.unhandled");
+            send_error_message(
+                stream,
+                request_id,
+                ErrorCode::Internal,
+                &format!("`{type_name}` is parsed but not yet dispatched"),
+                true,
+            )
+            .await;
+            Ok(DispatchOutcome::Continue)
+        }
+    }
+}
+
+/// 메시지의 `id` 필드를 추출한다. 스트리밍 메시지(`Bye`, `PtyInput`)는 `None`.
+fn client_message_id(msg: &ClientMessage) -> Option<MessageId> {
+    match msg {
+        ClientMessage::Hello { id, .. }
+        | ClientMessage::Ping { id, .. }
+        | ClientMessage::ListSessions { id, .. }
+        | ClientMessage::NewSession { id, .. }
+        | ClientMessage::Attach { id, .. }
+        | ClientMessage::Detach { id, .. }
+        | ClientMessage::KillSession { id, .. }
+        | ClientMessage::NewWindow { id, .. }
+        | ClientMessage::SplitPane { id, .. }
+        | ClientMessage::KillPane { id, .. }
+        | ClientMessage::KillWindow { id, .. }
+        | ClientMessage::Resize { id, .. }
+        | ClientMessage::SelectPane { id, .. }
+        | ClientMessage::SelectWindow { id, .. }
+        | ClientMessage::Command { id, .. } => Some(id.clone()),
+        ClientMessage::Bye { .. } | ClientMessage::PtyInput { .. } => None,
+    }
 }
 
 fn message_type_name(msg: &ClientMessage) -> &'static str {

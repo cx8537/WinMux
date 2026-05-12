@@ -57,10 +57,11 @@ fn handle_clap_error(err: &clap::Error) -> ExitCode {
     }
 }
 
-/// 명령별 분기. M0에서는 `version`만 실제 구현하고 나머지는 stub.
+/// 명령별 분기.
 fn dispatch(cli: &Cli) -> ExitCode {
     match &cli.command {
         Command::Version => handle_version(&cli.global),
+        Command::Ls(args) => handle_ls(args, &cli.global),
         other => unimplemented_stub(command_name(other)),
     }
 }
@@ -118,6 +119,116 @@ fn probe_server_version() -> Option<String> {
         let _ = client.close().await;
         Some(hello.server_version)
     })
+}
+
+/// `ls`: 서버에 `ListSessions`를 보내고 결과를 출력한다.
+fn handle_ls(_args: &args::LsArgs, global: &args::GlobalFlags) -> ExitCode {
+    let identity = match winmux_protocol::UserIdentity::detect() {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "winmux: {e}");
+            return ExitCode::from(exit::GENERAL_ERROR);
+        }
+    };
+    let pipe_name = identity.pipe_name();
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "winmux: failed to start runtime: {e}");
+            return ExitCode::from(exit::GENERAL_ERROR);
+        }
+    };
+
+    // `ClientOptions::open`은 tokio reactor에 등록을 시도하므로 runtime 컨텍스트
+    // 안에서 호출해야 한다 — 그래서 connect도 block_on 안으로 옮긴다.
+    let connect_outcome = runtime.block_on(async { winmux_ipc_client::connect(&pipe_name) });
+
+    let pipe = match connect_outcome {
+        Ok(p) => p,
+        Err(winmux_ipc_client::ConnectError::NotRunning(_)) => {
+            // spec § ls Exit codes: 2 — server not running (read-only이라 auto-start 안 함).
+            let _ = writeln!(io::stderr(), "winmux: server is not running");
+            return ExitCode::from(exit::NO_SERVER);
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "winmux: connect failed: {e}");
+            return ExitCode::from(exit::GENERAL_ERROR);
+        }
+    };
+
+    let result: anyhow::Result<Vec<winmux_protocol::SessionSummary>> = runtime.block_on(async {
+        let mut client = winmux_ipc_client::Client::new(pipe);
+        client
+            .hello(winmux_protocol::ClientKind::Cli, env!("CARGO_PKG_VERSION"))
+            .await?;
+        let id = client.next_message_id();
+        let resp = client
+            .request(&winmux_protocol::ClientMessage::ListSessions {
+                v: winmux_protocol::PROTOCOL_VERSION,
+                id,
+            })
+            .await?;
+        let sessions = match resp {
+            winmux_protocol::ServerMessage::SessionList { sessions, .. } => sessions,
+            winmux_protocol::ServerMessage::Error { payload, .. } => {
+                anyhow::bail!(
+                    "server error: {} ({})",
+                    payload.message,
+                    payload.code.as_str()
+                );
+            }
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        };
+        let _ = client.close().await;
+        Ok(sessions)
+    });
+
+    match result {
+        Ok(sessions) => {
+            print_session_list(&sessions, global);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "winmux: {e}");
+            ExitCode::from(exit::GENERAL_ERROR)
+        }
+    }
+}
+
+/// `ls`의 사람 친화 또는 JSON 출력.
+fn print_session_list(sessions: &[winmux_protocol::SessionSummary], global: &args::GlobalFlags) {
+    let mut stdout = io::stdout();
+    if global.json {
+        let array: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id.as_str(),
+                    "name": s.name,
+                    "windows": s.windows,
+                    "attached": s.attached_clients > 0,
+                })
+            })
+            .collect();
+        let _ = writeln!(stdout, "{}", serde_json::Value::Array(array));
+    } else if sessions.is_empty() {
+        let _ = writeln!(stdout, "(no sessions)");
+    } else {
+        for s in sessions {
+            let attached = if s.attached_clients > 0 {
+                "  (attached)"
+            } else {
+                ""
+            };
+            let plural = if s.windows == 1 { "window" } else { "windows" };
+            let _ = writeln!(stdout, "{}\t{} {}{}", s.name, s.windows, plural, attached);
+        }
+    }
 }
 
 fn unimplemented_stub(name: &str) -> ExitCode {

@@ -43,7 +43,11 @@ impl Client {
     }
 
     /// 다음 요청용 [`MessageId`]를 만든다. 포맷: 0-padded 20자리 hex.
-    fn allocate_message_id(&mut self) -> MessageId {
+    ///
+    /// 같은 `Client` 인스턴스 안에서 단조 증가하므로 한 연결 위에서는
+    /// `id`가 절대 중복되지 않는다. tray/cli가 자체적으로 id를 발급할
+    /// 필요가 없도록 `pub`로 노출한다.
+    pub fn next_message_id(&mut self) -> MessageId {
         let body = format!("{:020x}", self.next_msg_id);
         self.next_msg_id = self.next_msg_id.wrapping_add(1);
         // body는 항상 20자라 절대 빈 문자열이 아니다. fallback은 도달 불가.
@@ -54,7 +58,7 @@ impl Client {
     ///
     /// `version`은 호출자(보통 `env!("CARGO_PKG_VERSION")`)가 알린다.
     pub async fn hello(&mut self, kind: ClientKind, version: &str) -> Result<HelloAckInfo> {
-        let id = self.allocate_message_id();
+        let id = self.next_message_id();
         let hello = ClientMessage::Hello {
             v: PROTOCOL_VERSION,
             id,
@@ -88,6 +92,17 @@ impl Client {
             ),
             other => bail!("expected HelloAck, got {other:?}"),
         }
+    }
+
+    /// 한 요청을 보내고 한 응답을 받는다. 타임아웃은 [`DEFAULT_REQUEST_TIMEOUT`].
+    ///
+    /// 스트리밍 메시지(`PtyInput`)에는 쓰지 말 것 — 응답이 없으므로 영원히
+    /// 멈춘다. 그런 경우엔 [`Self::send`]만 호출한다.
+    pub async fn request(&mut self, msg: &ClientMessage) -> Result<ServerMessage> {
+        self.send(msg).await?;
+        timeout(DEFAULT_REQUEST_TIMEOUT, self.recv())
+            .await
+            .context("request timed out")?
     }
 
     /// 한 [`ClientMessage`]를 JSON Lines 한 줄로 보낸다.

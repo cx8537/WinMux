@@ -154,7 +154,12 @@ where
     Ok(Some(buf))
 }
 
-async fn send_server_message<S>(stream: &mut BufStream<S>, msg: &ServerMessage) -> Result<()>
+/// 한 [`ServerMessage`]를 JSON Lines 한 줄로 보낸다. 같은 crate 안의
+/// 다른 모듈(예: `pipe`의 dispatcher)이 재사용할 수 있도록 `pub(crate)`.
+pub(crate) async fn send_server_message<S>(
+    stream: &mut BufStream<S>,
+    msg: &ServerMessage,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -165,12 +170,15 @@ where
     Ok(())
 }
 
-/// Best-effort Error 전송. 클라이언트가 이미 끊었으면 결과를 무시한다.
-async fn send_error<S>(
+/// Best-effort `Error` 메시지 송신. 클라이언트가 이미 끊었으면 결과 무시.
+///
+/// `recoverable = false`면 호출자는 곧 연결을 끊어야 한다.
+pub(crate) async fn send_error_message<S>(
     stream: &mut BufStream<S>,
     id: Option<MessageId>,
     code: ErrorCode,
     message: &str,
+    recoverable: bool,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -180,10 +188,22 @@ async fn send_error<S>(
             id,
             code,
             message: message.to_owned(),
-            recoverable: false,
+            recoverable,
         },
     };
     let _ = send_server_message(stream, &err).await;
+}
+
+/// `recoverable = false`로 Error를 보내는 핸드셰이크 전용 단축형.
+async fn send_error<S>(
+    stream: &mut BufStream<S>,
+    id: Option<MessageId>,
+    code: ErrorCode,
+    message: &str,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send_error_message(stream, id, code, message, false).await;
 }
 
 fn variant_name(msg: &ClientMessage) -> &'static str {
