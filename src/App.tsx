@@ -49,6 +49,9 @@ export function App() {
   }, [setStatus, setAttached]);
 
   const activePane = attached?.panes[0];
+  const initialSnapshot = activePane
+    ? attached?.initial_snapshots.find((s) => s.pane_id === activePane.id)?.bytes_base64
+    : undefined;
 
   return (
     <div
@@ -57,7 +60,7 @@ export function App() {
     >
       <main className="flex-1 overflow-hidden">
         {attached && activePane ? (
-          <PaneView paneId={activePane.id} />
+          <PaneView paneId={activePane.id} initialSnapshotBase64={initialSnapshot} />
         ) : (
           <SessionLauncher />
         )}

@@ -17,8 +17,11 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use winmux_cli::args::NewSessionArgs;
 use winmux_cli::{KillFailure, NewSessionResult, kill_session_with, new_session_with};
-use winmux_ipc_client::connect_with_retry;
-use winmux_protocol::UserIdentity;
+use winmux_ipc_client::{Client, connect_with_retry};
+use winmux_protocol::{
+    AttachTarget, ClientKind, ClientMessage, PROTOCOL_VERSION, PaneSize, ServerMessage,
+    UserIdentity, codec,
+};
 use winmux_server::jobobj::JobObject;
 use winmux_server::pipe;
 
@@ -127,6 +130,81 @@ async fn kill_session_succeeds_for_existing_name() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("kill failed: {e:?}"))?;
     assert_eq!(killed, "doomed");
+
+    let _ = shutdown_tx.send(());
+    let _ = timeout(Duration::from_secs(5), server_task).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn attach_returns_non_empty_snapshot_after_pty_output() -> Result<()> {
+    // 시나리오: 세션 생성(detached) → 잠시 기다려 셸 prompt가 vterm에
+    // 누적되도록 한 뒤 → 다른 connection으로 Attach → initial_snapshots에
+    // 셸이 그린 화면이 base64로 들어있는지 확인.
+    //
+    // 셸의 정확한 prompt 문자열은 환경마다 다르므로(언어/cwd) 본 테스트는
+    // "stream의 길이가 빈 화면 baseline보다 크고, base64 해독이 가능하다"는
+    // 보수적 조건만 검증한다. 빈 화면 baseline = ESC[2J ESC[H ESC[0m +
+    // (rows 번 줄 시작 이동) + ESC[0m + cursor 위치. spawn 직후 어떤 셸이든
+    // banner나 prompt를 출력하므로 그보다 길어야 한다.
+    let username = unique_username("attach-snap");
+    let identity = UserIdentity::for_username(&username);
+    let pipe_name = identity.pipe_name();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server_identity = identity.clone();
+    let job = fresh_job();
+    let server_task =
+        tokio::spawn(async move { pipe::run(server_identity, job, shutdown_rx).await });
+
+    // (1) 세션을 detached로 만든다. detached 응답은 session_id를 안 돌려주므로
+    // 그 다음 단계에서 이름으로 attach한다.
+    let p1 = connect_with_retry(&pipe_name).await?;
+    let _ = new_session_with(p1, &empty_new_session_args(Some("with-shell"), true)).await?;
+
+    // (2) 셸이 prompt를 출력할 때까지 기다린다. 너무 짧으면 vterm이 아직
+    // 비어 있을 수 있고, 너무 길면 테스트가 느려진다. 200ms이면 PowerShell이
+    // banner를 그리기에 충분하다 (관찰 기반의 PoC heuristic).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // (3) Attach를 직접 보낸다 — cli에는 `attach_with` 헬퍼가 아직 없다.
+    let p2 = connect_with_retry(&pipe_name).await?;
+    let mut client = Client::new(p2);
+    client
+        .hello(ClientKind::Cli, env!("CARGO_PKG_VERSION"))
+        .await?;
+    let id = client.next_message_id();
+    let resp = client
+        .request(&ClientMessage::Attach {
+            v: PROTOCOL_VERSION,
+            id,
+            session: AttachTarget::Name("with-shell".to_owned()),
+            client_size: PaneSize { rows: 24, cols: 80 },
+        })
+        .await?;
+
+    match resp {
+        ServerMessage::Attached {
+            initial_snapshots, ..
+        } => {
+            assert_eq!(initial_snapshots.len(), 1, "expected single pane snapshot");
+            let snap = &initial_snapshots[0];
+            let bytes = codec::base64_decode(&snap.bytes_base64).context("decode snapshot")?;
+            // baseline = ESC[2J(4) + ESC[H(3) + ESC[0m(4) + per-line "ESC[L;1H"(>=6) ×40
+            //   + trailing ESC[0m(4) + cursor pos(>=6). 빈 80x40 화면이면 약 250바이트.
+            // 셸이 뭐든 한 줄이라도 prompt를 그렸다면 글리프가 추가되어 더 길다.
+            // 250보다 안전한 하한으로 200을 두고, 셸 출력이 있으면 그것보다 커진다.
+            assert!(
+                bytes.len() > 200,
+                "snapshot is suspiciously short ({} bytes) — vterm feeder may not be running",
+                bytes.len()
+            );
+            // 항상 ESC[2J로 시작해야 한다.
+            assert!(bytes.starts_with(b"\x1b[2J\x1b[H\x1b[0m"));
+        }
+        other => panic!("expected Attached, got {other:?}"),
+    }
+    let _ = client.close().await;
 
     let _ = shutdown_tx.send(());
     let _ = timeout(Duration::from_secs(5), server_task).await?;

@@ -14,6 +14,7 @@ pub mod pipe;
 pub mod pty;
 pub mod session;
 pub mod single_instance;
+pub mod terminal;
 
 use std::sync::Arc;
 

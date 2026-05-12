@@ -60,7 +60,7 @@ thiserror = { version = "1.0", default-features = false }
 portable-pty = { version = "0.8", default-features = false }
 
 # Virtual terminal state machine that backs the scrollback.
-alacritty_terminal = { version = "0.24", default-features = false }
+alacritty_terminal = { version = "0.25", default-features = false }
 
 # Bundled SQLite for the audit log (`%APPDATA%\winmux\audit.sqlite`).
 # `bundled` avoids needing a system libsqlite3 on Windows.

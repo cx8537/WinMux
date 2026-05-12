@@ -105,6 +105,24 @@ WinMux (please don't), things will break in interesting ways.
 
 ---
 
+### AT-4. M0 snapshot emits glyphs only (no SGR)
+
+`VirtualTerm::snapshot` in M0 PoC re-emits cell glyphs and final cursor
+position but discards per-cell SGR state (foreground/background, bold,
+underline, etc.). Reattach therefore shows the same characters in the
+same positions but in default colors, until the next live PTY output
+re-paints with full attributes.
+
+**Rationale.** SGR diff serialization is a meaningful chunk of code and
+not on the M0 acceptance path (`docs/spec/00-overview.md` only requires
+"detach and reattach show the previous screen"). Color-faithful
+snapshot is tracked for M1 alongside scrollback persistence.
+
+**Workaround.** None needed for M0. Users who need exact-color
+reattach can wait briefly for the shell to redraw.
+
+---
+
 ## Tauri 2.x
 
 ### TA-1. Tray APIs are newer than the rest of Tauri

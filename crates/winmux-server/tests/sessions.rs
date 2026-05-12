@@ -143,7 +143,11 @@ async fn new_session_auto_attaches_and_disconnect_decrements() -> Result<()> {
             assert_eq!(windows.len(), 1);
             assert_eq!(panes.len(), 1);
             assert!(panes[0].alive, "ConPTY-backed pane should be alive");
-            assert!(initial_snapshots.is_empty());
+            // VirtualTerm 통합 이후로는 새 세션 어태치 응답에도 panes와
+            // 1:1인 빈 화면 스냅샷이 들어온다 (`terminal::VirtualTerm::snapshot`).
+            assert_eq!(initial_snapshots.len(), 1);
+            assert_eq!(initial_snapshots[0].pane_id, panes[0].id);
+            assert!(!initial_snapshots[0].bytes_base64.is_empty());
             session_id
         }
         other => panic!("expected Attached, got {other:?}"),

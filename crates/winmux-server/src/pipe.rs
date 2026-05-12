@@ -25,12 +25,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufStream};
 use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use winmux_protocol::{
     AttachTarget, ClientMessage, ErrorCode, EventMessage, MessageId, NewSessionRequest,
-    PROTOCOL_VERSION, PaneId, PaneSize, ServerMessage, SessionId, UserIdentity, codec, decode_line,
+    PROTOCOL_VERSION, PaneId, PaneSize, PaneSnapshot, ServerMessage, SessionId, UserIdentity,
+    codec, decode_line,
 };
 
 use crate::jobobj::JobObject;
@@ -38,9 +39,10 @@ use crate::pipe::handshake::{perform_handshake, send_error_message, send_server_
 use crate::pipe::security::verify_client_user;
 use crate::pty::{Pty, PtyEvent, SpawnRequest};
 use crate::session::{
-    PaneRuntime, Registry, RegistryError, SharedRegistry, new_pane_id, new_session_id,
-    new_window_id,
+    PaneRuntime, Registry, RegistryError, SharedRegistry, VtermFeederHandle, new_pane_id,
+    new_session_id, new_window_id,
 };
+use crate::terminal::VirtualTerm;
 
 /// 단일 파이프 인스턴스당 커널 in/out 버퍼 hint(바이트).
 const PIPE_IN_BUF: u32 = 64 * 1024;
@@ -445,11 +447,22 @@ where
             return Ok(());
         }
     };
+
+    // 가상 터미널 + server-side feeder. feeder는 PTY broadcast를 구독해
+    // vterm을 누적 갱신한다 — reattach 시 snapshot()이 정확하도록.
+    let vterm = Arc::new(TokioMutex::new(VirtualTerm::new(
+        DEFAULT_PANE_ROWS,
+        DEFAULT_PANE_COLS,
+    )));
+    let feeder = spawn_vterm_feeder(pane_id.clone(), pty.subscribe(), vterm.clone());
+
     let runtime = PaneRuntime {
         pane_id: pane_id.clone(),
         window_id: window_id.clone(),
         session_id: session_id.clone(),
         pty,
+        vterm,
+        _vterm_feeder: VtermFeederHandle::new(feeder),
     };
 
     // 4) Registry 등록 — 실패 시 runtime drop → Pty drop → 자식 kill로 정리.
@@ -496,6 +509,7 @@ where
                 session_id: a.session_id.clone(),
                 forwarders,
             });
+            let initial_snapshots = collect_initial_snapshots(&ctx.registry, &a.session_id).await;
             let resp = ServerMessage::Attached {
                 v: PROTOCOL_VERSION,
                 id: request_id,
@@ -503,8 +517,7 @@ where
                 active_window: a.active_window,
                 windows: a.windows,
                 panes: a.panes,
-                // alacritty_terminal-based snapshot은 후속 단계.
-                initial_snapshots: Vec::new(),
+                initial_snapshots,
             };
             send_server_message(stream, &resp).await?;
         }
@@ -544,6 +557,7 @@ where
                 session_id: a.session_id.clone(),
                 forwarders,
             });
+            let initial_snapshots = collect_initial_snapshots(&ctx.registry, &a.session_id).await;
             let resp = ServerMessage::Attached {
                 v: PROTOCOL_VERSION,
                 id: request_id,
@@ -551,7 +565,7 @@ where
                 active_window: a.active_window,
                 windows: a.windows,
                 panes: a.panes,
-                initial_snapshots: Vec::new(),
+                initial_snapshots,
             };
             send_server_message(stream, &resp).await?;
         }
@@ -610,8 +624,12 @@ async fn handle_resize<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let pty = lock_registry(registry).pty_for_pane(&pane_id);
-    let Some(pty) = pty else {
+    let pty_and_vterm = {
+        let reg = lock_registry(registry);
+        reg.pty_for_pane(&pane_id)
+            .map(|pty| (pty, reg.vterm_for_pane(&pane_id)))
+    };
+    let Some((pty, vterm)) = pty_and_vterm else {
         send_error_message(
             stream,
             Some(request_id),
@@ -625,6 +643,11 @@ where
     match pty.try_resize(rows, cols) {
         Ok(()) => {
             lock_registry(registry).update_pane_size(&pane_id, PaneSize { rows, cols });
+            // ConPTY와 가상 터미널은 항상 같은 크기여야 한다 — 그렇지 않으면
+            // 다음 snapshot이 ConPTY의 wrap과 어긋난다.
+            if let Some(vt) = vterm {
+                vt.lock().await.resize(rows, cols);
+            }
             let resp = ServerMessage::Ok {
                 v: PROTOCOL_VERSION,
                 id: request_id,
@@ -662,6 +685,51 @@ fn spawn_forwarders(
         }));
     }
     handles
+}
+
+/// `pty.subscribe()`의 출력을 server-local `VirtualTerm`에 누적해서 reattach
+/// 스냅샷이 정확하도록 만든다. 본 task는 `PaneRuntime`이 살아있는 동안만
+/// 돌아야 하므로 [`VtermFeederHandle`]에 감싸 RAII로 abort된다.
+///
+/// CLAUDE.md Rule 1: 본 feeder는 받은 바이트 어떤 것도 로그하지 않는다.
+fn spawn_vterm_feeder(
+    pane_id: PaneId,
+    mut rx: broadcast::Receiver<PtyEvent>,
+    vterm: Arc<TokioMutex<VirtualTerm>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(PtyEvent::Output(bytes)) => {
+                    let mut vt = vterm.lock().await;
+                    vt.feed(&bytes);
+                }
+                Ok(PtyEvent::Exited { .. }) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(dropped = n, %pane_id, "vterm.broadcast.lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// 어태치 응답에 들어갈 [`PaneSnapshot`] 벡터를 만든다. 각 vterm에서 짧게
+/// lock을 잡아 `snapshot()`을 호출하므로 feeder와 직렬화된다.
+async fn collect_initial_snapshots(
+    registry: &SharedRegistry,
+    session_id: &SessionId,
+) -> Vec<PaneSnapshot> {
+    let vterms = lock_registry(registry).vterms_for_session(session_id);
+    let mut out = Vec::with_capacity(vterms.len());
+    for (pane_id, vterm) in vterms {
+        let bytes = vterm.lock().await.snapshot();
+        out.push(PaneSnapshot {
+            pane_id,
+            bytes_base64: codec::base64_encode(&bytes),
+        });
+    }
+    out
 }
 
 async fn forward_pane_events(

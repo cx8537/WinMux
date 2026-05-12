@@ -58,9 +58,16 @@ const CAMPBELL_THEME = {
 interface PaneViewProps {
   /** 본 패널의 식별자. 모든 IPC 호출에 그대로 실어 보낸다. */
   paneId: PaneId;
+  /**
+   * 어태치 응답에 함께 들어온 초기 화면 스냅샷(base64). 마운트 직후 한 번
+   * `term.write` 되어 reattach 시 직전 화면이 복원된다. `undefined`면
+   * 빈 화면으로 시작 (새 세션 첫 attach의 경우 — 그래도 ConPTY가 곧
+   * banner를 보낸다).
+   */
+  initialSnapshotBase64?: string | undefined;
 }
 
-export function PaneView({ paneId }: PaneViewProps) {
+export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement | null>(null);
   // i18n `t` 변경으로 effect가 재실행되지 않도록 ref로 빼서 항상 최신값만 본다.
@@ -99,6 +106,19 @@ export function PaneView({ paneId }: PaneViewProps) {
       fit.fit();
     } catch (e) {
       logger.warn('xterm.fit.initial_failed', { error: String(e) });
+    }
+    // 초기 스냅샷이 있으면 fit 직후·resize 호출 전에 그린다. 이렇게 해야
+    // (a) 잠시 빈 화면이 보이는 깜박임이 없고
+    // (b) 곧이어 발생하는 ConPTY resize가 wrap을 다시 계산하도록 한다.
+    // 스냅샷 자체는 ESC[2J + 셀 글리프 + cursor 이동이라 wrap을 임의로
+    // 다시 그려도 글리프 정합성은 무너지지 않는다.
+    if (initialSnapshotBase64) {
+      try {
+        const snap = base64ToBytes(initialSnapshotBase64);
+        term.write(snap);
+      } catch (e) {
+        logger.warn('pane.initial_snapshot.decode_failed', { error: String(e) });
+      }
     }
     // 서버는 NewSession 시 임시 40×120으로 PTY를 만든다. fit으로 계산한
     // 실제 사이즈를 즉시 전송해 ConPTY가 wrap을 다시 그리게 한다.
@@ -157,7 +177,10 @@ export function PaneView({ paneId }: PaneViewProps) {
       if (unlistenEvent) unlistenEvent();
       term.dispose();
     };
-  }, [paneId]);
+    // 스냅샷이 바뀌었다는 것은 새 어태치라는 뜻이므로 effect를 재실행해
+    // 깨끗한 Terminal에 새 화면을 그리도록 둔다. (보통 paneId가 같이 바뀌므로
+    // 어느 deps로 트리거되든 결과는 같다.)
+  }, [paneId, initialSnapshotBase64]);
 
   return (
     <div

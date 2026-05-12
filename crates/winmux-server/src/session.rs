@@ -15,6 +15,8 @@ use anyhow::Result;
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinHandle;
 use ulid::Ulid;
 use winmux_protocol::{
     AttachTarget, KillSessionTarget, NewSessionRequest, PaneId, PaneSize, PaneSummary, SessionId,
@@ -22,6 +24,7 @@ use winmux_protocol::{
 };
 
 use crate::pty::Pty;
+use crate::terminal::VirtualTerm;
 
 /// 패널 한 개 분량의 메타데이터(ConPTY 미통합 stub 포함).
 #[derive(Clone, Debug)]
@@ -131,6 +134,10 @@ pub struct AttachResult {
 }
 
 /// 한 패널의 런타임 자원. 메타데이터([`PaneState`])와 동일한 lifecycle.
+///
+/// `vterm`은 PTY 출력 broadcast를 server-side에서 별도로 구독해 갱신하는
+/// 가상 터미널 상태다. `_vterm_feeder`는 그 구독 task의 RAII 핸들 —
+/// `PaneRuntime`이 drop되면 abort된다.
 pub struct PaneRuntime {
     /// 와이어 식별자.
     pub pane_id: PaneId,
@@ -140,6 +147,30 @@ pub struct PaneRuntime {
     pub session_id: SessionId,
     /// 셸의 PTY. `Arc`로 broadcast subscriber와 writer가 공유한다.
     pub pty: Arc<Pty>,
+    /// 가상 터미널 상태. snapshot/resize 시 lock하므로 `tokio::Mutex`.
+    pub vterm: Arc<TokioMutex<VirtualTerm>>,
+    /// `vterm.feed`를 구동하는 백그라운드 task. Drop 시 abort.
+    ///
+    /// 필드 자체는 다른 곳에서 참조되지 않지만 RAII로 핸들을 들고 있어야
+    /// PaneRuntime이 drop될 때 feeder task가 abort된다.
+    pub _vterm_feeder: VtermFeederHandle,
+}
+
+/// `PaneRuntime`이 drop되면 자동으로 abort되는 task 핸들 wrapper.
+pub struct VtermFeederHandle(JoinHandle<()>);
+
+impl VtermFeederHandle {
+    /// 백그라운드 feeder task의 핸들을 RAII로 감싼다.
+    #[must_use]
+    pub fn new(handle: JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for VtermFeederHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// 세션 in-memory 저장소. 단일 server 프로세스 안에서 공유된다.
@@ -300,6 +331,12 @@ impl Registry {
         self.pane_runtimes.get(pane_id).map(|r| r.pty.clone())
     }
 
+    /// 한 패널의 가상 터미널 핸들을 빌려준다(있으면).
+    #[must_use]
+    pub fn vterm_for_pane(&self, pane_id: &PaneId) -> Option<Arc<TokioMutex<VirtualTerm>>> {
+        self.pane_runtimes.get(pane_id).map(|r| r.vterm.clone())
+    }
+
     /// 한 세션의 모든 (패널-ID, PTY) 쌍을 모은다 — broadcast forwarder 등록에 쓴다.
     #[must_use]
     pub fn ptys_for_session(&self, session_id: &SessionId) -> Vec<(PaneId, Arc<Pty>)> {
@@ -311,6 +348,27 @@ impl Registry {
             for pane in &window.panes {
                 if let Some(rt) = self.pane_runtimes.get(&pane.id) {
                     out.push((pane.id.clone(), rt.pty.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// 한 세션의 모든 활성 윈도우 패널 (패널-ID, vterm) 쌍을 모은다.
+    /// `initial_snapshots` 생성 시 사용.
+    #[must_use]
+    pub fn vterms_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Vec<(PaneId, Arc<TokioMutex<VirtualTerm>>)> {
+        let Some(session) = self.sessions.get(session_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for window in &session.windows {
+            for pane in &window.panes {
+                if let Some(rt) = self.pane_runtimes.get(&pane.id) {
+                    out.push((pane.id.clone(), rt.vterm.clone()));
                 }
             }
         }
