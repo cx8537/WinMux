@@ -5045,6 +5045,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "tauri",
  "tokio",
  "tracing",
  "tracing-subscriber",

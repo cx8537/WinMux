@@ -1,5 +1,28 @@
 {
   "app": {
     "name": "WinMux"
+  },
+  "status": {
+    "connecting": "Connecting to server…",
+    "connected": "Connected to server v{{version}}",
+    "disconnected": "Disconnected: {{reason}}"
+  },
+  "launcher": {
+    "title": "No session attached",
+    "description": "Start a new shell session to begin.",
+    "newSessionLabel": "Session name",
+    "newSessionPlaceholder": "untitled",
+    "shellLabel": "Shell (optional)",
+    "shellPlaceholder": "powershell.exe",
+    "create": "New session",
+    "creating": "Starting…"
+  },
+  "pane": {
+    "deadBanner": "Pane is no longer alive — close to dismiss.",
+    "exited": "[Pane exited with code {{code}}]"
+  },
+  "errors": {
+    "ipcUnavailable": "IPC is not connected. Start winmux-server.exe and try again.",
+    "newSessionFailed": "Failed to create session: {{message}}"
   }
 }

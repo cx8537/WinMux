@@ -5,15 +5,14 @@
 //! winmux-app — WinMux 트레이 프로세스를 감싸는 Tauri 호스트.
 //!
 //! 본 바이너리의 책임:
-//! 1. `winmux-tray` 라이브러리의 초기화를 실행한다(미래의 IPC 클라이언트
-//!    부트스트랩 자리).
+//! 1. `winmux-tray`의 `tracing` subscriber를 가장 먼저 설치한다.
 //! 2. Tauri 런타임을 시작하고, 시스템 트레이 아이콘을 등록한다.
-//! 3. 메인 윈도우의 닫기 버튼을 "숨기기"로 가로채 서버를 살려둔다
+//! 3. `winmux-tray::start_ipc`로 Named Pipe IPC 매니저를 띄우고 그 핸들을
+//!    Tauri State에 등록한다. webview가 `winmux_*` 명령을 호출하면 본
+//!    매니저를 거쳐 server와 통신한다.
+//! 4. 메인 윈도우의 닫기 버튼을 "숨기기"로 가로채 서버를 살려둔다
 //!    (`docs/spec/00-overview.md` § Tray shutdown).
-//! 4. 트레이 좌클릭과 "Open main window" 메뉴로 윈도우를 다시 띄운다.
-//!
-//! 본 단계에서 트레이 메뉴는 최소(`Open` / `Quit`)다. 세션 서브메뉴와
-//! "Settings" 같은 spec 항목들은 IPC가 연결된 후 단계적으로 채운다.
+//! 5. 트레이 좌클릭과 "Open main window" 메뉴로 윈도우를 다시 띄운다.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -29,12 +28,20 @@ const MENU_OPEN_MAIN: &str = "open_main";
 const MENU_QUIT: &str = "quit";
 
 fn main() -> ExitCode {
-    if let Err(err) = winmux_tray::run() {
-        let _ = writeln!(io::stderr(), "winmux-tray initialization failed: {err:#}");
-        return ExitCode::from(1);
-    }
+    winmux_tray::install_tracing();
 
     let result = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            winmux_tray::commands::winmux_server_status,
+            winmux_tray::commands::winmux_ping,
+            winmux_tray::commands::winmux_list_sessions,
+            winmux_tray::commands::winmux_new_session,
+            winmux_tray::commands::winmux_attach,
+            winmux_tray::commands::winmux_detach,
+            winmux_tray::commands::winmux_kill_session,
+            winmux_tray::commands::winmux_pty_input,
+            winmux_tray::commands::winmux_resize,
+        ])
         .setup(setup)
         .on_window_event(handle_window_event)
         .run(tauri::generate_context!());
@@ -49,6 +56,11 @@ fn main() -> ExitCode {
 }
 
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // IPC 매니저를 백그라운드에서 시작하고, 그 핸들을 State로 등록한다.
+    // 명령 핸들러는 `tauri::State<'_, IpcHandle>`로 꺼내 쓴다.
+    let ipc_handle = winmux_tray::start_ipc(app.handle().clone())?;
+    app.manage(ipc_handle);
+
     let open_main = MenuItem::with_id(app, MENU_OPEN_MAIN, "Open main window", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "Quit WinMux", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
