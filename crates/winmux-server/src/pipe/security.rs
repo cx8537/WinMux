@@ -146,12 +146,7 @@ impl PipeAcl {
             .context("InitializeSecurityDescriptor failed")?;
         // SAFETY: sd는 init 완료, acl_buf는 우리가 살려두는 ACL을 가리킨다.
         unsafe {
-            SetSecurityDescriptorDacl(
-                sd_ptr,
-                true,
-                Some(acl_buf.as_ptr().cast::<ACL>()),
-                false,
-            )
+            SetSecurityDescriptorDacl(sd_ptr, true, Some(acl_buf.as_ptr().cast::<ACL>()), false)
         }
         .context("SetSecurityDescriptorDacl failed")?;
 

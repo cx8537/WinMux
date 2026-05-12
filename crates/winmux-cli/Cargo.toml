@@ -9,6 +9,13 @@ description = "Single-shot WinMux CLI client."
 [lints]
 workspace = true
 
+# lib + bin layout (matches winmux-server). The library hosts argument
+# parsing and command dispatch so integration/unit tests can drive it
+# without spawning `winmux.exe`.
+[lib]
+name = "winmux_cli"
+path = "src/lib.rs"
+
 [[bin]]
 # Produces `winmux.exe` per docs/build/release.md § Build.
 name = "winmux"

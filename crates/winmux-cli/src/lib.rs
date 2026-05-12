@@ -1,0 +1,123 @@
+//! `winmux-cli` 라이브러리 파사드.
+//!
+//! 바이너리 [`run`]은 인자 파싱과 명령 dispatch만 담당한다. M0 단계에서는
+//! 대부분의 명령이 "아직 구현되지 않음" 메시지와 함께 [`exit::GENERAL_ERROR`]로
+//! 종료한다 — IPC 호출과 출력 포매팅은 후속 작업에서 단계적으로 채운다.
+//!
+//! 본 라이브러리는 `println!`/`eprintln!` 매크로를 쓰지 않는다 (lint
+//! 차단). 표준 출력에는 `writeln!(io::stdout(), ...)`, 에러 메시지는
+//! `writeln!(io::stderr(), ...)`를 직접 호출한다.
+
+pub mod args;
+
+use std::io::{self, Write};
+use std::process::ExitCode;
+
+use clap::Parser;
+
+use crate::args::{Cli, Command};
+
+/// 표준 exit 코드 (`docs/spec/06-cli.md` § Exit Codes).
+pub mod exit {
+    /// 성공.
+    pub const SUCCESS: u8 = 0;
+    /// 일반 오류(메시지를 stderr에 남긴다).
+    pub const GENERAL_ERROR: u8 = 1;
+    /// 서버가 실행 중이지 않고 자동 기동도 실패.
+    pub const NO_SERVER: u8 = 2;
+    /// 타깃(세션·윈도우·패널)을 찾지 못함.
+    pub const TARGET_NOT_FOUND: u8 = 3;
+    /// 프로토콜 버전 불일치.
+    pub const PROTOCOL_MISMATCH: u8 = 4;
+    /// SID 불일치 등 권한 거부.
+    pub const PERMISSION_DENIED: u8 = 5;
+    /// 인자 형식 오류(`EX_USAGE`와 일치).
+    pub const USAGE_ERROR: u8 = 64;
+}
+
+/// 동기 entry. 인자 파싱 후 명령별 핸들러로 분기.
+#[must_use]
+pub fn run() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(err) => return handle_clap_error(&err),
+    };
+    dispatch(&cli)
+}
+
+/// clap이 만든 오류를 적절한 출력과 exit code로 매핑.
+fn handle_clap_error(err: &clap::Error) -> ExitCode {
+    // clap의 print는 자체적으로 stdout/stderr를 올바르게 선택한다.
+    let _ = err.print();
+    match err.kind() {
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+            ExitCode::SUCCESS
+        }
+        _ => ExitCode::from(exit::USAGE_ERROR),
+    }
+}
+
+/// 명령별 분기. M0에서는 `version`만 실제 구현하고 나머지는 stub.
+fn dispatch(cli: &Cli) -> ExitCode {
+    match &cli.command {
+        Command::Version => handle_version(&cli.global),
+        other => unimplemented_stub(command_name(other)),
+    }
+}
+
+fn handle_version(global: &args::GlobalFlags) -> ExitCode {
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let proto = winmux_protocol::PROTOCOL_VERSION;
+    let mut stdout = io::stdout();
+
+    if global.json {
+        // 서버 연결 전이므로 server 필드는 null. 후속 작업에서 채운다.
+        let value = serde_json::json!({
+            "winmux": cli_version,
+            "server": null,
+            "protocol": proto,
+        });
+        let _ = writeln!(stdout, "{value}");
+    } else {
+        let _ = writeln!(stdout, "winmux {cli_version}");
+        let _ = writeln!(stdout, "server unknown (IPC not yet wired)");
+        let _ = writeln!(stdout, "protocol v{proto}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn unimplemented_stub(name: &str) -> ExitCode {
+    let mut stderr = io::stderr();
+    let _ = writeln!(
+        stderr,
+        "winmux: `{name}` is parsed but not yet wired to the server in this build"
+    );
+    ExitCode::from(exit::GENERAL_ERROR)
+}
+
+fn command_name(c: &Command) -> &'static str {
+    match c {
+        Command::Ls(_) => "ls",
+        Command::NewSession(_) => "new-session",
+        Command::Attach(_) => "attach",
+        Command::Detach => "detach",
+        Command::KillSession(_) => "kill-session",
+        Command::KillWindow(_) => "kill-window",
+        Command::KillPane(_) => "kill-pane",
+        Command::SendKeys(_) => "send-keys",
+        Command::ListWindows(_) => "list-windows",
+        Command::ListPanes(_) => "list-panes",
+        Command::SplitWindow(_) => "split-window",
+        Command::SelectPane(_) => "select-pane",
+        Command::ResizePane(_) => "resize-pane",
+        Command::CapturePane(_) => "capture-pane",
+        Command::DisplayMessage(_) => "display-message",
+        Command::SourceFile(_) => "source-file",
+        Command::ShowOptions(_) => "show-options",
+        Command::BindKey(_) => "bind-key",
+        Command::UnbindKey(_) => "unbind-key",
+        Command::KillServer => "kill-server",
+        Command::StartServer => "start-server",
+        Command::Version => "version",
+    }
+}
