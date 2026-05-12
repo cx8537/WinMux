@@ -53,6 +53,7 @@ tracing-appender = { version = "0.2", default-features = false }
 
 # `anyhow` only at the binary boundary; library modules use thiserror.
 anyhow = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = { version = "1.0", default-features = false }
 
 # ConPTY plumbing. `portable-pty` wraps `CreatePseudoConsole`,
 # handles the HPCON lifecycle, and exposes a stable cross-version API.

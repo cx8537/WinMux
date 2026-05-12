@@ -10,6 +10,7 @@
 
 pub mod logging;
 pub mod pipe;
+pub mod session;
 pub mod single_instance;
 
 use anyhow::{Context, Result};
