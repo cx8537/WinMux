@@ -68,22 +68,56 @@ fn dispatch(cli: &Cli) -> ExitCode {
 fn handle_version(global: &args::GlobalFlags) -> ExitCode {
     let cli_version = env!("CARGO_PKG_VERSION");
     let proto = winmux_protocol::PROTOCOL_VERSION;
+    let server_info = probe_server_version();
     let mut stdout = io::stdout();
 
     if global.json {
-        // 서버 연결 전이므로 server 필드는 null. 후속 작업에서 채운다.
+        let server_value = server_info.as_deref().map_or(serde_json::Value::Null, |s| {
+            serde_json::Value::String(s.to_owned())
+        });
         let value = serde_json::json!({
             "winmux": cli_version,
-            "server": null,
+            "server": server_value,
             "protocol": proto,
         });
         let _ = writeln!(stdout, "{value}");
     } else {
         let _ = writeln!(stdout, "winmux {cli_version}");
-        let _ = writeln!(stdout, "server unknown (IPC not yet wired)");
+        match &server_info {
+            Some(s) => {
+                let _ = writeln!(stdout, "server {s}");
+            }
+            None => {
+                let _ = writeln!(stdout, "server unknown (not running)");
+            }
+        }
         let _ = writeln!(stdout, "protocol v{proto}");
     }
     ExitCode::SUCCESS
+}
+
+/// 서버에 한 번 connect + Hello 시도. 실패는 silent (read-only 명령이라
+/// 서버 자동 기동도 하지 않는다 — spec § Server Auto-Start).
+fn probe_server_version() -> Option<String> {
+    let identity = winmux_protocol::UserIdentity::detect().ok()?;
+    let pipe_name = identity.pipe_name();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .ok()?;
+
+    runtime.block_on(async move {
+        let pipe = winmux_ipc_client::connect(&pipe_name).ok()?;
+        let mut client = winmux_ipc_client::Client::new(pipe);
+        let hello = client
+            .hello(winmux_protocol::ClientKind::Cli, env!("CARGO_PKG_VERSION"))
+            .await
+            .ok()?;
+        let _ = client.close().await;
+        Some(hello.server_version)
+    })
 }
 
 fn unimplemented_stub(name: &str) -> ExitCode {

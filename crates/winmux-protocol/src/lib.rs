@@ -10,13 +10,16 @@
 
 pub mod codec;
 pub mod errors;
+pub mod identity;
 pub mod ids;
 pub mod messages;
+pub mod sha256;
 pub mod types;
 pub mod version;
 
 pub use crate::codec::{CodecError, MAX_MESSAGE_BYTES, decode_line, encode_line};
 pub use crate::errors::{ErrorCode, ErrorPayload, ProtocolError};
+pub use crate::identity::{IdentityError, UserIdentity};
 pub use crate::ids::{ClientId, IdError, MessageId, PaneId, SessionId, WindowId};
 pub use crate::messages::{
     AttachTarget, ClientMessage, EventMessage, KillSessionTarget, PaneSnapshot, ServerMessage,

@@ -4990,6 +4990,19 @@ dependencies = [
  "clap",
  "serde_json",
  "tokio",
+ "winmux-ipc-client",
+ "winmux-protocol",
+]
+
+[[package]]
+name = "winmux-ipc-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
  "winmux-protocol",
 ]
 
@@ -5020,6 +5033,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "windows 0.58.0",
+ "winmux-ipc-client",
  "winmux-protocol",
 ]
 
@@ -5032,6 +5046,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "winmux-ipc-client",
  "winmux-protocol",
 ]
 

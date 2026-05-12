@@ -25,9 +25,10 @@ use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 use winmux_protocol::{ClientMessage, decode_line};
 
+use winmux_protocol::UserIdentity;
+
 use crate::pipe::handshake::perform_handshake;
 use crate::pipe::security::verify_client_user;
-use crate::user::UserIdentity;
 
 /// 단일 파이프 인스턴스당 커널 in/out 버퍼 hint(바이트).
 const PIPE_IN_BUF: u32 = 64 * 1024;

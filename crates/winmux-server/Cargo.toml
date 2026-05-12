@@ -100,3 +100,9 @@ time = { version = "0.3", default-features = false, features = [
     "macros",
     "serde",
 ] }
+
+# Integration tests drive the real Hello handshake through the same
+# `Client` that the tray and CLI use, so failures on either side
+# surface here. Not a runtime dependency.
+[dev-dependencies]
+winmux-ipc-client = { path = "../winmux-ipc-client" }

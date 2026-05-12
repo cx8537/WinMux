@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/winmux-protocol",
+    "crates/winmux-ipc-client",
     "crates/winmux-server",
     "crates/winmux-tray",
     "crates/winmux-cli",

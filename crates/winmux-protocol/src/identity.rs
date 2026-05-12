@@ -12,9 +12,17 @@
 //! 동일한 prefix가 단일-인스턴스 뮤텍스 이름에도 쓰이므로 두 식별자가
 //! 항상 페어로 움직인다.
 
-use anyhow::{Context, Result};
+use thiserror::Error;
 
 use crate::sha256;
+
+/// [`UserIdentity::detect`] 실패 사유.
+#[derive(Debug, Error)]
+pub enum IdentityError {
+    /// `USERNAME` 환경변수가 없거나 비어 있다.
+    #[error("USERNAME environment variable is not set or is empty")]
+    UsernameMissing,
+}
 
 /// 와이어용 사용자 식별자 묶음.
 #[derive(Clone, Debug)]
@@ -28,23 +36,14 @@ pub struct UserIdentity {
 impl UserIdentity {
     /// 현재 프로세스 환경에서 식별자를 추출한다.
     ///
-    /// `USERNAME`이 비어 있거나 누락되면 `Err`.
-    pub fn detect() -> Result<Self> {
-        let username =
-            std::env::var("USERNAME").context("USERNAME environment variable is not set")?;
+    /// # Errors
+    /// `USERNAME`이 비어 있거나 누락되면 [`IdentityError::UsernameMissing`].
+    pub fn detect() -> Result<Self, IdentityError> {
+        let username = std::env::var("USERNAME").map_err(|_| IdentityError::UsernameMissing)?;
         if username.is_empty() {
-            anyhow::bail!("USERNAME environment variable is empty");
+            return Err(IdentityError::UsernameMissing);
         }
-        let hex = sha256::sha256_hex(username.as_bytes());
-        // SHA-256 hex는 항상 64자이므로 .get(..8)은 절대 None이 아니다.
-        let user_sha8 = hex
-            .get(..8)
-            .context("SHA-256 hex output shorter than 8 chars (unreachable)")?
-            .to_owned();
-        Ok(Self {
-            username,
-            user_sha8,
-        })
+        Ok(Self::for_username(&username))
     }
 
     /// 명시적 사용자명으로 식별자를 만든다. 테스트에서 결정론적인 값을
@@ -52,6 +51,7 @@ impl UserIdentity {
     #[must_use]
     pub fn for_username(username: &str) -> Self {
         let hex = sha256::sha256_hex(username.as_bytes());
+        // SHA-256 hex는 항상 64자이므로 .get(..8)은 절대 None이 아니다.
         let user_sha8 = hex.get(..8).unwrap_or("00000000").to_owned();
         Self {
             username: username.to_owned(),

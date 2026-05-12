@@ -10,13 +10,12 @@
 
 pub mod logging;
 pub mod pipe;
-pub mod sha256;
 pub mod single_instance;
-pub mod user;
 
 use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
+use winmux_protocol::UserIdentity;
 
 /// 동기 entry. 로깅 init과 Tokio 런타임 빌드까지 책임진다.
 ///
@@ -39,7 +38,7 @@ pub fn run() -> Result<()> {
 /// 이미 운영 중이라면 `Ok(())`로 조용히 반환한다(`docs/spec/00-overview.md` §
 /// Server lifecycle 2).
 pub async fn run_async() -> Result<()> {
-    let identity = user::UserIdentity::detect().context("detect current user")?;
+    let identity = UserIdentity::detect().context("detect current user")?;
 
     let mutex_name = identity.mutex_name();
     let _instance_guard = match single_instance::acquire(&mutex_name)? {

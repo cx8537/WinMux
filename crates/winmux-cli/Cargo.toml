@@ -23,6 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 winmux-protocol = { path = "../winmux-protocol" }
+winmux-ipc-client = { path = "../winmux-ipc-client" }
 
 # Argument parsing. `derive` powers the structopt-style subcommand
 # enums we will define in src/args.rs.
