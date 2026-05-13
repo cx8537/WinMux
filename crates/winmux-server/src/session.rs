@@ -115,9 +115,33 @@ pub enum RegistryError {
     /// 이름 또는 ID로 해당 세션을 찾지 못함.
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    /// ID로 해당 윈도우를 찾지 못함.
+    #[error("window not found: {0}")]
+    WindowNotFound(String),
+    /// ID로 해당 패널을 찾지 못함.
+    #[error("pane not found: {0}")]
+    PaneNotFound(String),
     /// 이미 같은 이름의 세션이 있음.
     #[error("session name `{0}` already exists")]
     NameTaken(String),
+}
+
+/// `kill_pane` 결과. 호출자가 attach guard 정리 여부를 판단하는 데 쓴다.
+#[derive(Clone, Debug)]
+pub struct KillPaneOutcome {
+    /// 패널이 속해 있던 세션.
+    pub session_id: SessionId,
+    /// 그 패널이 마지막이라 세션 자체가 사라졌는지.
+    pub session_removed: bool,
+}
+
+/// `kill_window` 결과.
+#[derive(Clone, Debug)]
+pub struct KillWindowOutcome {
+    /// 윈도우가 속해 있던 세션.
+    pub session_id: SessionId,
+    /// 그 윈도우가 마지막이라 세션 자체가 사라졌는지.
+    pub session_removed: bool,
 }
 
 /// `Attach` 응답에 필요한 정보를 묶은 결과.
@@ -429,6 +453,148 @@ impl Registry {
         if let Some(session) = self.sessions.get_mut(id) {
             session.attached_clients = session.attached_clients.saturating_sub(1);
         }
+    }
+
+    /// `pane_id`가 속한 (세션, 윈도우)를 찾는다. `send-keys`처럼 패널 단위
+    /// dispatch에서 메타 정보를 얻는 데 쓴다.
+    #[must_use]
+    pub fn locate_pane(&self, pane_id: &PaneId) -> Option<(SessionId, WindowId)> {
+        for session in self.sessions.values() {
+            for window in &session.windows {
+                if window.panes.iter().any(|p| &p.id == pane_id) {
+                    return Some((session.id.clone(), window.id.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// 활성 윈도우의 활성 패널을 가져온다. `send-keys` 등에서 target이 세션
+    /// 이름까지만 명시되었을 때 쓰인다.
+    #[must_use]
+    pub fn active_pane_of_session(&self, session_id: &SessionId) -> Option<PaneId> {
+        let session = self.sessions.get(session_id)?;
+        let active_window_id = &session.active_window;
+        let active_window = session.windows.iter().find(|w| &w.id == active_window_id)?;
+        Some(active_window.active_pane.clone())
+    }
+
+    /// 세션 이름으로 SessionId를 찾는다.
+    #[must_use]
+    pub fn session_id_by_name(&self, name: &str) -> Option<SessionId> {
+        self.name_index.get(name).cloned()
+    }
+
+    /// 패널 한 개를 제거한다. 그 패널이 윈도우의 유일한 패널이었으면 윈도우도
+    /// 함께 닫히고, 윈도우가 세션의 유일한 윈도우였으면 세션도 닫힌다 — tmux와
+    /// 같은 cascade 규칙(`docs/spec/03-session-model.md` § Empty containers
+    /// disappear).
+    ///
+    /// 반환은 `(닫힌 세션 여부, 제거된 패널의 세션 ID)`. 호출자가 attach
+    /// guard 정리 여부를 판단하는 데 쓴다.
+    pub fn kill_pane(&mut self, pane_id: &PaneId) -> Result<KillPaneOutcome, RegistryError> {
+        let Some((session_id, window_id)) = self.locate_pane(pane_id) else {
+            return Err(RegistryError::PaneNotFound(pane_id.to_string()));
+        };
+
+        // 메타데이터에서 패널 제거.
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| RegistryError::SessionNotFound(session_id.to_string()))?;
+        let window = session
+            .windows
+            .iter_mut()
+            .find(|w| w.id == window_id)
+            .ok_or_else(|| RegistryError::WindowNotFound(window_id.to_string()))?;
+        window.panes.retain(|p| &p.id != pane_id);
+        // active_pane이 사라졌다면 남은 첫 패널로 옮긴다.
+        if window.active_pane == *pane_id
+            && let Some(first) = window.panes.first()
+        {
+            window.active_pane = first.id.clone();
+        }
+        // 윈도우가 빈 경우 → 윈도우 자체 제거.
+        let window_now_empty = window.panes.is_empty();
+
+        // 런타임도 제거(=Pty drop → 자식 kill, vterm feeder abort).
+        self.pane_runtimes.remove(pane_id);
+
+        if window_now_empty {
+            session.windows.retain(|w| w.id != window_id);
+            // active_window가 사라졌다면 첫 윈도우로.
+            if session.active_window == window_id
+                && let Some(first) = session.windows.first()
+            {
+                session.active_window = first.id.clone();
+            }
+        }
+
+        // 세션이 빈 경우 → 세션 자체 제거.
+        let session_now_empty = session.windows.is_empty();
+        let outcome = if session_now_empty {
+            let name = session.name.clone();
+            self.sessions.remove(&session_id);
+            self.name_index.remove(&name);
+            KillPaneOutcome {
+                session_id,
+                session_removed: true,
+            }
+        } else {
+            KillPaneOutcome {
+                session_id,
+                session_removed: false,
+            }
+        };
+        Ok(outcome)
+    }
+
+    /// 윈도우 한 개를 제거한다 (= 그 안의 모든 패널을 차례로 kill_pane). 세션의
+    /// 유일한 윈도우였으면 세션도 닫힌다.
+    pub fn kill_window(
+        &mut self,
+        window_id: &WindowId,
+    ) -> Result<KillWindowOutcome, RegistryError> {
+        // 윈도우가 속한 세션 찾기.
+        let mut found_session: Option<SessionId> = None;
+        for s in self.sessions.values() {
+            if s.windows.iter().any(|w| &w.id == window_id) {
+                found_session = Some(s.id.clone());
+                break;
+            }
+        }
+        let Some(session_id) = found_session else {
+            return Err(RegistryError::WindowNotFound(window_id.to_string()));
+        };
+
+        // 패널 ID 목록을 미리 모아둔다 (mutable borrow 충돌 회피).
+        let pane_ids: Vec<PaneId> = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.windows.iter().find(|w| &w.id == window_id))
+            .map(|w| w.panes.iter().map(|p| p.id.clone()).collect())
+            .unwrap_or_default();
+
+        // 각 패널을 kill_pane으로 정리. 마지막 패널 kill에서 윈도우/세션도
+        // 자동으로 정리될 수 있다.
+        let mut session_removed = false;
+        for pid in pane_ids {
+            match self.kill_pane(&pid) {
+                Ok(o) => {
+                    if o.session_removed {
+                        session_removed = true;
+                    }
+                }
+                Err(_) => {
+                    // 이미 정리된 경우 무시.
+                }
+            }
+        }
+
+        Ok(KillWindowOutcome {
+            session_id,
+            session_removed,
+        })
     }
 
     fn resolve_attach_target(&self, target: &AttachTarget) -> Option<SessionId> {

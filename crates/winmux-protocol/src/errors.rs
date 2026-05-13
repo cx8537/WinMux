@@ -22,6 +22,8 @@ pub enum ErrorCode {
     UnknownMessageType,
     /// 참조한 세션이 없음.
     SessionNotFound,
+    /// 참조한 윈도우가 없음.
+    WindowNotFound,
     /// 참조한 패널이 없음.
     PaneNotFound,
     /// 클라이언트 SID가 서버 사용자와 일치하지 않음.
@@ -43,6 +45,7 @@ impl ErrorCode {
             Self::ProtocolViolation => "PROTOCOL_VIOLATION",
             Self::UnknownMessageType => "UNKNOWN_MESSAGE_TYPE",
             Self::SessionNotFound => "SESSION_NOT_FOUND",
+            Self::WindowNotFound => "WINDOW_NOT_FOUND",
             Self::PaneNotFound => "PANE_NOT_FOUND",
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::TooLarge => "TOO_LARGE",

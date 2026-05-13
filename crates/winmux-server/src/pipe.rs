@@ -29,12 +29,13 @@ use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use winmux_protocol::{
-    AttachTarget, ClientMessage, ErrorCode, EventMessage, MessageId, NewSessionRequest,
-    PROTOCOL_VERSION, PaneId, PaneSize, PaneSnapshot, ServerMessage, SessionId, UserIdentity,
-    codec, decode_line,
+    AttachTarget, ClientMessage, CommandRequest, CommandResultPayload, ErrorCode, EventMessage,
+    MessageId, NewSessionRequest, PROTOCOL_VERSION, PaneId, PaneSize, PaneSnapshot, ServerMessage,
+    SessionId, UserIdentity, WindowId, codec, decode_line,
 };
 
 use crate::jobobj::JobObject;
+use crate::keys::{KeyError, tokens_to_bytes};
 use crate::pipe::handshake::{perform_handshake, send_error_message, send_server_message};
 use crate::pipe::security::verify_client_user;
 use crate::pty::{Pty, PtyEvent, SpawnRequest};
@@ -379,6 +380,18 @@ where
             handle_resize(stream, &ctx.registry, id, pane_id, rows, cols).await?;
             Ok(DispatchOutcome::Continue)
         }
+        ClientMessage::KillPane { id, pane_id, .. } => {
+            handle_kill_pane(stream, ctx, attach, id, pane_id).await?;
+            Ok(DispatchOutcome::Continue)
+        }
+        ClientMessage::KillWindow { id, window_id, .. } => {
+            handle_kill_window(stream, ctx, attach, id, window_id).await?;
+            Ok(DispatchOutcome::Continue)
+        }
+        ClientMessage::Command { id, request, .. } => {
+            handle_command(stream, ctx, attach, id, request).await?;
+            Ok(DispatchOutcome::Continue)
+        }
         other => {
             let request_id = client_message_id(&other);
             warn!(message_type = %type_name, "client.message.unhandled");
@@ -685,6 +698,330 @@ fn spawn_forwarders(
         }));
     }
     handles
+}
+
+/// `KillPane` 분기. 패널을 정리하고 cascade로 사라진 윈도우/세션이 있으면
+/// attach guard도 함께 푼다.
+async fn handle_kill_pane<S>(
+    stream: &mut BufStream<S>,
+    ctx: &ClientContext,
+    attach: &mut Option<AttachGuard>,
+    request_id: MessageId,
+    pane_id: PaneId,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let outcome = lock_registry(&ctx.registry).kill_pane(&pane_id);
+    match outcome {
+        Ok(o) => {
+            info!(pane = %pane_id, session_removed = o.session_removed, "pane.killed");
+            // 현재 클라이언트가 그 세션에 어태치 중이고 세션이 사라졌다면
+            // attach guard를 풀어 forwarder도 함께 abort되도록 한다.
+            if o.session_removed
+                && attach
+                    .as_ref()
+                    .is_some_and(|g| g.session_id == o.session_id)
+            {
+                *attach = None;
+            }
+            let resp = ServerMessage::Ok {
+                v: PROTOCOL_VERSION,
+                id: request_id,
+            };
+            send_server_message(stream, &resp).await?;
+        }
+        Err(RegistryError::PaneNotFound(_)) => {
+            send_error_message(
+                stream,
+                Some(request_id),
+                ErrorCode::PaneNotFound,
+                "pane not found",
+                true,
+            )
+            .await;
+        }
+        Err(e) => {
+            send_error_message(
+                stream,
+                Some(request_id),
+                ErrorCode::Internal,
+                &e.to_string(),
+                true,
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// `KillWindow` 분기. 윈도우 안의 모든 패널을 정리한다.
+async fn handle_kill_window<S>(
+    stream: &mut BufStream<S>,
+    ctx: &ClientContext,
+    attach: &mut Option<AttachGuard>,
+    request_id: MessageId,
+    window_id: WindowId,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let outcome = lock_registry(&ctx.registry).kill_window(&window_id);
+    match outcome {
+        Ok(o) => {
+            info!(window = %window_id, session_removed = o.session_removed, "window.killed");
+            if o.session_removed
+                && attach
+                    .as_ref()
+                    .is_some_and(|g| g.session_id == o.session_id)
+            {
+                *attach = None;
+            }
+            let resp = ServerMessage::Ok {
+                v: PROTOCOL_VERSION,
+                id: request_id,
+            };
+            send_server_message(stream, &resp).await?;
+        }
+        Err(RegistryError::WindowNotFound(_)) => {
+            send_error_message(
+                stream,
+                Some(request_id),
+                ErrorCode::WindowNotFound,
+                "window not found",
+                true,
+            )
+            .await;
+        }
+        Err(e) => {
+            send_error_message(
+                stream,
+                Some(request_id),
+                ErrorCode::Internal,
+                &e.to_string(),
+                true,
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// `Command` 분기 (현재는 `send-keys`만 지원). 다른 tmux 명령은 미구현으로
+/// `CommandResult { ok: false, ... }`를 돌려준다.
+async fn handle_command<S>(
+    stream: &mut BufStream<S>,
+    ctx: &ClientContext,
+    attach: &Option<AttachGuard>,
+    request_id: MessageId,
+    request: CommandRequest,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let tmux = request.tmux.as_str();
+    match tmux {
+        "send-keys" => handle_send_keys(stream, ctx, attach, request_id, &request.args).await,
+        other => {
+            let resp = ServerMessage::CommandResult {
+                v: PROTOCOL_VERSION,
+                id: request_id,
+                result: CommandResultPayload {
+                    ok: false,
+                    stdout: None,
+                    stderr: Some(format!("unsupported tmux command: {other}")),
+                },
+            };
+            send_server_message(stream, &resp).await?;
+            Ok(())
+        }
+    }
+}
+
+/// `send-keys` 분기: target 결정 → 키 변환 → PTY write → `CommandResult`.
+async fn handle_send_keys<S>(
+    stream: &mut BufStream<S>,
+    ctx: &ClientContext,
+    attach: &Option<AttachGuard>,
+    request_id: MessageId,
+    args: &[String],
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (target, key_tokens) = match parse_send_keys_args(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            let resp = ServerMessage::CommandResult {
+                v: PROTOCOL_VERSION,
+                id: request_id,
+                result: CommandResultPayload {
+                    ok: false,
+                    stdout: None,
+                    stderr: Some(msg),
+                },
+            };
+            send_server_message(stream, &resp).await?;
+            return Ok(());
+        }
+    };
+
+    // 키 변환은 PTY를 잡기 전에 — 키 이름이 잘못된 경우에도 PTY는 건드리지
+    // 않는다.
+    let bytes = match tokens_to_bytes(&key_tokens) {
+        Ok(b) => b,
+        Err(KeyError::Unsupported(name)) => {
+            let resp = ServerMessage::CommandResult {
+                v: PROTOCOL_VERSION,
+                id: request_id,
+                result: CommandResultPayload {
+                    ok: false,
+                    stdout: None,
+                    stderr: Some(format!(
+                        "unsupported key in M0 PoC: `{name}` (see docs/spec/04-key-handling.md)"
+                    )),
+                },
+            };
+            send_server_message(stream, &resp).await?;
+            return Ok(());
+        }
+    };
+
+    // target → pane_id 해상도.
+    let pane_id = match resolve_send_keys_target(&ctx.registry, attach, target.as_deref()) {
+        Ok(p) => p,
+        Err(msg) => {
+            let resp = ServerMessage::CommandResult {
+                v: PROTOCOL_VERSION,
+                id: request_id,
+                result: CommandResultPayload {
+                    ok: false,
+                    stdout: None,
+                    stderr: Some(msg),
+                },
+            };
+            send_server_message(stream, &resp).await?;
+            return Ok(());
+        }
+    };
+
+    let pty = lock_registry(&ctx.registry).pty_for_pane(&pane_id);
+    let Some(pty) = pty else {
+        let resp = ServerMessage::CommandResult {
+            v: PROTOCOL_VERSION,
+            id: request_id,
+            result: CommandResultPayload {
+                ok: false,
+                stdout: None,
+                stderr: Some("pane has no live PTY".to_owned()),
+            },
+        };
+        send_server_message(stream, &resp).await?;
+        return Ok(());
+    };
+
+    if let Err(e) = pty.write_input(bytes).await {
+        warn!(error = %e, %pane_id, "send_keys.write_failed");
+        let resp = ServerMessage::CommandResult {
+            v: PROTOCOL_VERSION,
+            id: request_id,
+            result: CommandResultPayload {
+                ok: false,
+                stdout: None,
+                stderr: Some(format!("write failed: {e}")),
+            },
+        };
+        send_server_message(stream, &resp).await?;
+        return Ok(());
+    }
+
+    let resp = ServerMessage::CommandResult {
+        v: PROTOCOL_VERSION,
+        id: request_id,
+        result: CommandResultPayload {
+            ok: true,
+            stdout: None,
+            stderr: None,
+        },
+    };
+    send_server_message(stream, &resp).await?;
+    Ok(())
+}
+
+/// `send-keys`의 args를 `(target, key_tokens)`로 가른다. `-t TARGET`이
+/// 있으면 첫 두 토큰을 소비한다. 그 외 플래그(M0에서는 지원하지 않음)는
+/// 에러로 본다 — 사용자가 별 의도로 넣은 입력을 키로 흘리지 않기 위해.
+fn parse_send_keys_args(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut iter = args.iter().peekable();
+    let mut target: Option<String> = None;
+    while let Some(arg) = iter.peek() {
+        if arg.as_str() == "-t" {
+            iter.next();
+            let value = iter
+                .next()
+                .ok_or_else(|| "send-keys: -t requires a target argument".to_owned())?;
+            target = Some(value.clone());
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            return Err(format!("send-keys: unknown flag `{arg}` in M0 PoC"));
+        } else {
+            break;
+        }
+    }
+    let keys: Vec<String> = iter.cloned().collect();
+    if keys.is_empty() {
+        return Err("send-keys: no key tokens given".to_owned());
+    }
+    Ok((target, keys))
+}
+
+/// target 문자열을 PaneId로 해상한다. M0 PoC에서 지원하는 형태:
+///
+/// - `None` → 현재 attach 중인 세션의 active pane.
+/// - `pane-XYZ` → 그대로.
+/// - `ses-XYZ` → 그 세션의 active pane.
+/// - 이름 (`work`, `work:0`, `work:0.0`) → `work` 부분만 보고 그 세션의
+///   active pane. `:windowindex.paneindex`는 M0에서는 무시한다 (한 세션-한
+///   윈도우-한 패널 가정 — 본 PoC 범위 내).
+fn resolve_send_keys_target(
+    registry: &SharedRegistry,
+    attach: &Option<AttachGuard>,
+    target: Option<&str>,
+) -> Result<PaneId, String> {
+    let reg = lock_registry(registry);
+    match target {
+        None => {
+            let session_id = attach
+                .as_ref()
+                .map(|g| g.session_id.clone())
+                .ok_or_else(|| "send-keys: no target and client is not attached".to_owned())?;
+            reg.active_pane_of_session(&session_id)
+                .ok_or_else(|| format!("send-keys: session has no active pane: {session_id}"))
+        }
+        Some(t) => {
+            // pane-XYZ 형태인지 가장 먼저 확인.
+            if t.starts_with("pane-") {
+                let pid = PaneId::from_raw(t.to_owned());
+                if reg.pty_for_pane(&pid).is_some() {
+                    return Ok(pid);
+                }
+                return Err(format!("send-keys: pane not found: {t}"));
+            }
+            // ses-XYZ 형태.
+            if t.starts_with("ses-") {
+                let sid = SessionId::from_raw(t.to_owned());
+                return reg
+                    .active_pane_of_session(&sid)
+                    .ok_or_else(|| format!("send-keys: session not found: {t}"));
+            }
+            // 이름. `name`, `name:0`, `name:0.0` 모두 `name`만 본다.
+            let name = t.split(':').next().unwrap_or(t);
+            let sid = reg
+                .session_id_by_name(name)
+                .ok_or_else(|| format!("send-keys: session not found: {name}"))?;
+            reg.active_pane_of_session(&sid)
+                .ok_or_else(|| format!("send-keys: session has no active pane: {name}"))
+        }
+    }
 }
 
 /// `pty.subscribe()`의 출력을 server-local `VirtualTerm`에 누적해서 reattach

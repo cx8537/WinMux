@@ -21,11 +21,15 @@ use clap::Parser;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 use winmux_ipc_client::{Client, ConnectError, connect, connect_with_retry};
 use winmux_protocol::{
-    ClientKind, ClientMessage, ErrorCode, KillSessionTarget, NewSessionRequest, PROTOCOL_VERSION,
-    PaneSummary, ServerMessage, SessionId, SessionSummary, UserIdentity, WindowId,
+    ClientKind, ClientMessage, CommandRequest, ErrorCode, KillSessionTarget, NewSessionRequest,
+    PROTOCOL_VERSION, PaneId, PaneSummary, ServerMessage, SessionId, SessionSummary, UserIdentity,
+    WindowId,
 };
 
-use crate::args::{Cli, Command, GlobalFlags, KillSessionArgs, LsArgs, NewSessionArgs};
+use crate::args::{
+    Cli, Command, GlobalFlags, KillSessionArgs, LsArgs, NewSessionArgs, SendKeysArgs,
+    TargetOnlyArgs,
+};
 
 /// 표준 exit 코드 (`docs/spec/06-cli.md` § Exit Codes).
 pub mod exit {
@@ -74,6 +78,9 @@ fn dispatch(cli: &Cli) -> ExitCode {
         Command::Ls(args) => handle_ls(args, &cli.global),
         Command::NewSession(args) => handle_new_session(args, &cli.global),
         Command::KillSession(args) => handle_kill_session(args, &cli.global),
+        Command::KillPane(args) => handle_kill_pane(args, &cli.global),
+        Command::KillWindow(args) => handle_kill_window(args, &cli.global),
+        Command::SendKeys(args) => handle_send_keys(args, &cli.global),
         other => unimplemented_stub(command_name(other)),
     }
 }
@@ -548,6 +555,293 @@ pub enum KillFailure {
     NotFound(String),
     /// 그 외 서버/와이어 오류 — exit code 1.
     Server(String),
+}
+
+// ---------------------------------------------------------------------------
+// kill-pane / kill-window
+// ---------------------------------------------------------------------------
+
+/// `kill-pane`. 타깃 인자는 PaneId(`pane-XYZ`)만 지원한다 — `session:0.0` 같은
+/// 인덱스 타깃은 M0 PoC에서 한 패널만 다루므로 의미가 없다.
+fn handle_kill_pane(args: &TargetOnlyArgs, global: &GlobalFlags) -> ExitCode {
+    let identity = match UserIdentity::detect() {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "winmux: {e}");
+            return ExitCode::from(exit::GENERAL_ERROR);
+        }
+    };
+    let pipe_name = identity.pipe_name();
+    let pane_id = match parse_pane_target(&args.target) {
+        Ok(p) => p,
+        Err(msg) => return emit_error(&msg, exit::USAGE_ERROR, global),
+    };
+
+    let runtime = match make_runtime() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+
+    let outcome = runtime.block_on(async {
+        let pipe = ensure_server_running(&pipe_name)
+            .await
+            .map_err(EnsureFailure::into_tuple)?;
+        kill_pane_with(pipe, &pane_id).await.map_err(|e| match e {
+            KillFailure::NotFound(t) => (exit::TARGET_NOT_FOUND, format!("pane not found: '{t}'")),
+            KillFailure::Server(msg) => (exit::GENERAL_ERROR, msg),
+        })
+    });
+
+    match outcome {
+        Ok(()) => {
+            let mut stdout = io::stdout();
+            if global.json {
+                let v = serde_json::json!({ "killed_pane": pane_id.as_str() });
+                let _ = writeln!(stdout, "{v}");
+            } else if !global.quiet {
+                let _ = writeln!(stdout, "killed pane {}", pane_id.as_str());
+            }
+            ExitCode::SUCCESS
+        }
+        Err((code, message)) => emit_error(&message, code, global),
+    }
+}
+
+/// `kill-pane` lower-level. 통합 테스트가 직접 호출한다.
+pub async fn kill_pane_with(pipe: NamedPipeClient, pane_id: &PaneId) -> Result<(), KillFailure> {
+    let mut client = Client::new(pipe);
+    client
+        .hello(ClientKind::Cli, env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|e| KillFailure::Server(format!("hello: {e}")))?;
+    let id = client.next_message_id();
+    let resp = client
+        .request(&ClientMessage::KillPane {
+            v: PROTOCOL_VERSION,
+            id,
+            pane_id: pane_id.clone(),
+        })
+        .await
+        .map_err(|e| KillFailure::Server(format!("request: {e}")))?;
+    let result = match resp {
+        ServerMessage::Ok { .. } => Ok(()),
+        ServerMessage::Error { payload, .. } => {
+            if payload.code == ErrorCode::PaneNotFound {
+                Err(KillFailure::NotFound(pane_id.as_str().to_owned()))
+            } else {
+                Err(KillFailure::Server(format!(
+                    "{} ({})",
+                    payload.message,
+                    payload.code.as_str()
+                )))
+            }
+        }
+        other => Err(KillFailure::Server(format!(
+            "unexpected response: {other:?}"
+        ))),
+    };
+    let _ = client.close().await;
+    result
+}
+
+/// `kill-window`. 타깃은 WindowId(`win-XYZ`)만 지원.
+fn handle_kill_window(args: &TargetOnlyArgs, global: &GlobalFlags) -> ExitCode {
+    let identity = match UserIdentity::detect() {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "winmux: {e}");
+            return ExitCode::from(exit::GENERAL_ERROR);
+        }
+    };
+    let pipe_name = identity.pipe_name();
+    let window_id = match parse_window_target(&args.target) {
+        Ok(w) => w,
+        Err(msg) => return emit_error(&msg, exit::USAGE_ERROR, global),
+    };
+
+    let runtime = match make_runtime() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+
+    let outcome = runtime.block_on(async {
+        let pipe = ensure_server_running(&pipe_name)
+            .await
+            .map_err(EnsureFailure::into_tuple)?;
+        kill_window_with(pipe, &window_id)
+            .await
+            .map_err(|e| match e {
+                KillFailure::NotFound(t) => {
+                    (exit::TARGET_NOT_FOUND, format!("window not found: '{t}'"))
+                }
+                KillFailure::Server(msg) => (exit::GENERAL_ERROR, msg),
+            })
+    });
+
+    match outcome {
+        Ok(()) => {
+            let mut stdout = io::stdout();
+            if global.json {
+                let v = serde_json::json!({ "killed_window": window_id.as_str() });
+                let _ = writeln!(stdout, "{v}");
+            } else if !global.quiet {
+                let _ = writeln!(stdout, "killed window {}", window_id.as_str());
+            }
+            ExitCode::SUCCESS
+        }
+        Err((code, message)) => emit_error(&message, code, global),
+    }
+}
+
+/// `kill-window` lower-level.
+pub async fn kill_window_with(
+    pipe: NamedPipeClient,
+    window_id: &WindowId,
+) -> Result<(), KillFailure> {
+    let mut client = Client::new(pipe);
+    client
+        .hello(ClientKind::Cli, env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|e| KillFailure::Server(format!("hello: {e}")))?;
+    let id = client.next_message_id();
+    let resp = client
+        .request(&ClientMessage::KillWindow {
+            v: PROTOCOL_VERSION,
+            id,
+            window_id: window_id.clone(),
+        })
+        .await
+        .map_err(|e| KillFailure::Server(format!("request: {e}")))?;
+    let result = match resp {
+        ServerMessage::Ok { .. } => Ok(()),
+        ServerMessage::Error { payload, .. } => {
+            if payload.code == ErrorCode::WindowNotFound {
+                Err(KillFailure::NotFound(window_id.as_str().to_owned()))
+            } else {
+                Err(KillFailure::Server(format!(
+                    "{} ({})",
+                    payload.message,
+                    payload.code.as_str()
+                )))
+            }
+        }
+        other => Err(KillFailure::Server(format!(
+            "unexpected response: {other:?}"
+        ))),
+    };
+    let _ = client.close().await;
+    result
+}
+
+fn parse_pane_target(s: &str) -> Result<PaneId, String> {
+    if !s.starts_with(PaneId::PREFIX) {
+        return Err(format!(
+            "kill-pane target must be a pane id (`pane-...`), got `{s}`"
+        ));
+    }
+    PaneId::from_str(s).map_err(|e| format!("invalid pane id `{s}`: {e}"))
+}
+
+fn parse_window_target(s: &str) -> Result<WindowId, String> {
+    if !s.starts_with(WindowId::PREFIX) {
+        return Err(format!(
+            "kill-window target must be a window id (`win-...`), got `{s}`"
+        ));
+    }
+    WindowId::from_str(s).map_err(|e| format!("invalid window id `{s}`: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// send-keys
+// ---------------------------------------------------------------------------
+
+/// `send-keys`. `Command { tmux: "send-keys" }`로 매핑한다.
+fn handle_send_keys(args: &SendKeysArgs, global: &GlobalFlags) -> ExitCode {
+    let identity = match UserIdentity::detect() {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "winmux: {e}");
+            return ExitCode::from(exit::GENERAL_ERROR);
+        }
+    };
+    let pipe_name = identity.pipe_name();
+
+    let runtime = match make_runtime() {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+
+    let outcome = runtime.block_on(async {
+        let pipe = ensure_server_running(&pipe_name)
+            .await
+            .map_err(EnsureFailure::into_tuple)?;
+        send_keys_with(pipe, args.target.as_deref(), &args.keys)
+            .await
+            .map_err(|e| (exit::GENERAL_ERROR, e))
+    });
+
+    match outcome {
+        Ok(()) => {
+            if !global.quiet && global.json {
+                let _ = writeln!(io::stdout(), "{}", serde_json::json!({ "ok": true }));
+            }
+            ExitCode::SUCCESS
+        }
+        Err((code, message)) => emit_error(&message, code, global),
+    }
+}
+
+/// `send-keys` lower-level. 통합 테스트가 직접 호출한다.
+///
+/// 와이어 args는 `[-t TARGET]` 다음에 키 토큰들이 오는 형식이다 — server 측
+/// 파서가 그 형태를 기대한다 (`pipe::parse_send_keys_args`).
+pub async fn send_keys_with(
+    pipe: NamedPipeClient,
+    target: Option<&str>,
+    keys: &[String],
+) -> Result<(), String> {
+    let mut client = Client::new(pipe);
+    client
+        .hello(ClientKind::Cli, env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|e| format!("hello: {e}"))?;
+
+    let mut args: Vec<String> = Vec::new();
+    if let Some(t) = target {
+        args.push("-t".to_owned());
+        args.push(t.to_owned());
+    }
+    args.extend(keys.iter().cloned());
+
+    let id = client.next_message_id();
+    let resp = client
+        .request(&ClientMessage::Command {
+            v: PROTOCOL_VERSION,
+            id,
+            request: CommandRequest {
+                tmux: "send-keys".to_owned(),
+                args,
+            },
+        })
+        .await
+        .map_err(|e| format!("request: {e}"))?;
+    let result = match resp {
+        ServerMessage::CommandResult { result, .. } => {
+            if result.ok {
+                Ok(())
+            } else {
+                Err(result
+                    .stderr
+                    .unwrap_or_else(|| "send-keys failed".to_owned()))
+            }
+        }
+        ServerMessage::Error { payload, .. } => {
+            Err(format!("{} ({})", payload.message, payload.code.as_str()))
+        }
+        other => Err(format!("unexpected response: {other:?}")),
+    };
+    let _ = client.close().await;
+    result
 }
 
 fn parse_kill_target(s: &str) -> KillSessionTarget {

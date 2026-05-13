@@ -9,6 +9,7 @@
 //! "server" 컬럼과 1:1 대응한다.
 
 pub mod jobobj;
+pub mod keys;
 pub mod logging;
 pub mod pipe;
 pub mod pty;

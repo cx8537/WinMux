@@ -407,6 +407,7 @@ Common codes:
 | `PROTOCOL_VIOLATION` | Message out of sequence or malformed |
 | `UNKNOWN_MESSAGE_TYPE` | Type field not recognized at this protocol version |
 | `SESSION_NOT_FOUND` | Referenced session does not exist |
+| `WINDOW_NOT_FOUND` | Referenced window does not exist |
 | `PANE_NOT_FOUND` | Referenced pane does not exist |
 | `PERMISSION_DENIED` | Client SID does not match server SID |
 | `TOO_LARGE` | Message exceeded 16 MiB |
