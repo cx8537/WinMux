@@ -14,6 +14,7 @@
 //! `Arc`로 카운트되므로 백그라운드 task와 Tauri State에 동시에 보관해도 된다.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
-use winmux_ipc_client::connect_with_retry;
+use winmux_ipc_client::{ConnectError, connect, connect_with_retry};
 use winmux_protocol::{
     ClientKind, ClientMessage, MessageId, PROTOCOL_VERSION, PaneId, PaneSnapshot, PaneSummary,
     ServerMessage, SessionId, UserIdentity, WindowId, WindowSummary, decode_line, encode_line,
@@ -203,18 +204,11 @@ async fn manager_main(
     info!(pipe = %pipe_name, "tray.ipc.connecting");
     set_status(&app, &inner, ServerStatus::Connecting).await;
 
-    let pipe = match connect_with_retry(&pipe_name).await {
+    let pipe = match ensure_server_running(&pipe_name).await {
         Ok(p) => p,
-        Err(e) => {
-            warn!(error = %e, "tray.ipc.connect_failed");
-            set_status(
-                &app,
-                &inner,
-                ServerStatus::Disconnected {
-                    reason: e.to_string(),
-                },
-            )
-            .await;
+        Err(reason) => {
+            warn!(reason = %reason, "tray.ipc.connect_failed");
+            set_status(&app, &inner, ServerStatus::Disconnected { reason }).await;
             return;
         }
     };
@@ -479,6 +473,79 @@ where
     }
     let body = decode_line(&buf).map_err(|e| anyhow::anyhow!("frame: {e}"))?;
     serde_json::from_str::<ServerMessage>(body).map_err(|e| anyhow::anyhow!("parse: {e}"))
+}
+
+/// spec § 00-overview "Tray.Server discovery"의 자동 기동 절차.
+///
+/// 1. 한 번 connect 시도. 떠 있으면 그대로 사용.
+/// 2. `ERROR_FILE_NOT_FOUND`이면 같은 디렉터리의 `winmux-server.exe`를
+///    `DETACHED_PROCESS | CREATE_NO_WINDOW`로 spawn.
+/// 3. 100/300/1000/3000 ms 백오프로 재시도. 끝까지 안 잡히면 실패.
+///
+/// 실패 시 사람이 읽을 수 있는 사유 문자열을 돌려준다 — 호출자가 그대로
+/// [`ServerStatus::Disconnected`]에 넣어 webview로 emit한다.
+async fn ensure_server_running(
+    pipe_name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, String> {
+    // 1) 빠른 단발 시도. 이미 떠 있으면 즉시 끝.
+    match connect(pipe_name) {
+        Ok(p) => return Ok(p),
+        Err(ConnectError::NotRunning(_)) => {
+            // 아래에서 spawn.
+        }
+        Err(e) => return Err(format!("connect failed: {e}")),
+    }
+
+    // 2) winmux-server.exe 위치 결정 + spawn.
+    let server_exe = locate_server_exe().map_err(|e| format!("server is not running and {e}"))?;
+    info!(path = %server_exe.display(), "tray.ipc.server_spawn");
+    spawn_server_detached(&server_exe)
+        .map_err(|e| format!("failed to spawn `{}`: {e}", server_exe.display()))?;
+
+    // 3) 백오프로 재시도. 첫 시도는 즉시이므로 startup overlap에도 안전.
+    connect_with_retry(pipe_name)
+        .await
+        .map_err(|e| format!("server failed to start: {e}"))
+}
+
+/// `winmux-app.exe`(=Tauri 호스트)와 같은 폴더의 `winmux-server.exe`를 찾는다.
+/// cargo dev 빌드에서는 `target/debug/`에 둘 다 있고, 인스톨러는 같은 install
+/// dir에 둔다.
+fn locate_server_exe() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| "current_exe has no parent directory".to_owned())?;
+    let server = parent.join("winmux-server.exe");
+    if !server.exists() {
+        return Err(format!("`{}` not found", server.display()));
+    }
+    Ok(server)
+}
+
+/// `DETACHED_PROCESS | CREATE_NO_WINDOW`로 server를 띄운다. spec § Tray.Server
+/// discovery 의 spawn flags.
+#[cfg(windows)]
+fn spawn_server_detached(server_exe: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::process::CommandExt;
+    // Win32 process creation flags. winbase.h.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    std::process::Command::new(server_exe)
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_server_detached(_server_exe: &Path) -> Result<(), std::io::Error> {
+    Err(std::io::Error::other(
+        "winmux-server spawn is only supported on Windows",
+    ))
 }
 
 #[cfg(test)]

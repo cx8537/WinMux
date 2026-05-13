@@ -10,12 +10,20 @@
   "launcher": {
     "title": "No session attached",
     "description": "Start a new shell session to begin.",
+    "existingSessionsTitle": "Existing sessions",
+    "newSessionTitle": "Create new session",
     "newSessionLabel": "Session name",
     "newSessionPlaceholder": "untitled",
     "shellLabel": "Shell (optional)",
     "shellPlaceholder": "powershell.exe",
     "create": "New session",
-    "creating": "Starting…"
+    "creating": "Starting…",
+    "attach": "Attach",
+    "attaching": "Attaching…",
+    "loadingSessions": "Loading sessions…",
+    "noSessions": "No sessions are currently live on the server.",
+    "sessionMeta": "{{windows}} windows · {{attached}} attached",
+    "alreadyExists": "A session with that name already exists. Attach to it from the list above."
   },
   "pane": {
     "deadBanner": "Pane is no longer alive — close to dismiss.",
@@ -23,6 +31,7 @@
   },
   "errors": {
     "ipcUnavailable": "IPC is not connected. Start winmux-server.exe and try again.",
-    "newSessionFailed": "Failed to create session: {{message}}"
+    "newSessionFailed": "Failed to create session: {{message}}",
+    "attachFailed": "Failed to attach to session: {{message}}"
   }
 }

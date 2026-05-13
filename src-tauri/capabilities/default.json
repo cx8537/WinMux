@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "메인 윈도우의 webview에 부여하는 기본 권한 묶음. WinMux의 IPC는 (1) custom commands(winmux_*) — generate_handler에 등록되어 capability와 무관하게 작동, (2) push 이벤트 listen — `core:event:default`가 필요, (3) 표준 윈도우 제어(close/minimize) — `core:window:default`가 포함. CLAUDE.md 보안 규칙상 file/shell/http 같은 광역 권한은 부여하지 않는다.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

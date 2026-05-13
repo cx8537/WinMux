@@ -10,12 +10,20 @@
   "launcher": {
     "title": "어태치된 세션 없음",
     "description": "새 셸 세션을 시작해서 사용해 보세요.",
+    "existingSessionsTitle": "기존 세션",
+    "newSessionTitle": "새 세션 만들기",
     "newSessionLabel": "세션 이름",
     "newSessionPlaceholder": "untitled",
     "shellLabel": "셸 (선택)",
     "shellPlaceholder": "powershell.exe",
     "create": "새 세션",
-    "creating": "시작 중…"
+    "creating": "시작 중…",
+    "attach": "어태치",
+    "attaching": "어태치 중…",
+    "loadingSessions": "세션 목록 불러오는 중…",
+    "noSessions": "현재 서버에 살아 있는 세션이 없습니다.",
+    "sessionMeta": "윈도우 {{windows}}개 · 어태치 {{attached}}",
+    "alreadyExists": "이미 같은 이름의 세션이 있습니다. 위 목록에서 어태치해 주세요."
   },
   "pane": {
     "deadBanner": "패널이 더 이상 활성 상태가 아닙니다 — 닫아 주세요.",
@@ -23,6 +31,7 @@
   },
   "errors": {
     "ipcUnavailable": "IPC가 연결되어 있지 않습니다. winmux-server.exe를 실행한 뒤 다시 시도하세요.",
-    "newSessionFailed": "세션 생성에 실패했습니다: {{message}}"
+    "newSessionFailed": "세션 생성에 실패했습니다: {{message}}",
+    "attachFailed": "세션 어태치에 실패했습니다: {{message}}"
   }
 }

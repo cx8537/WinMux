@@ -13,7 +13,8 @@ import { useEffect } from 'react';
 import { PaneView } from '@/components/PaneView';
 import { SessionLauncher } from '@/components/SessionLauncher';
 import { StatusBar } from '@/components/StatusBar';
-import { onServerBye, onServerStatus } from '@/lib/server-client';
+import { logger } from '@/lib/logger';
+import { getServerStatus, onServerBye, onServerStatus } from '@/lib/server-client';
 import { useSessionStore } from '@/store/session';
 
 export function App() {
@@ -32,6 +33,19 @@ export function App() {
       if (disposed) fn();
       else unlistenStatus = fn;
     });
+
+    // tray의 `server:status` emit이 webview의 listen 등록 *전에* 일어났을
+    // 수 있다 (manager_main이 setup()에서 즉시 spawn되어 첫 emit이 React
+    // mount보다 빠를 수 있음). listen만 의지하면 그 시점에 발사된 이벤트는
+    // 영원히 못 받으므로, 마운트 직후 한 번 명시적으로 현재 상태를 가져와
+    // store를 sync한다. inner.status는 tray가 Mutex 안에 항상 보관한다.
+    void getServerStatus()
+      .then((status) => {
+        if (!disposed) setStatus(status);
+      })
+      .catch((e: unknown) => {
+        logger.warn('app.initial_status.failed', { error: String(e) });
+      });
 
     void onServerBye(() => {
       setAttached(null);
