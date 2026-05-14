@@ -31,6 +31,15 @@ export interface KeyboardManagerOptions {
   readonly onAction: (action: KeyboardAction) => void;
   /** state 변화를 외부에 알려 indicator를 갱신하기 위한 옵션 콜백. */
   readonly onStateChange?: (state: KeyboardState) => void;
+  /** 현재 IME composition 진행 중인지 알려 주는 동기 조회자.
+   *
+   *  spec § 04 §§ 183-185, § accessibility.md §§ 87-91: prefix는 keydown
+   *  단계에서 IME보다 먼저 잡혀야 한다. 일반 키가 composition 도중에
+   *  들어오면 매니저는 손대지 않고 xterm/IME 측에 넘긴다(true 반환). */
+  readonly isComposing?: () => boolean;
+  /** 합성 도중 prefix가 눌렸을 때 합성을 취소하기 위해 호출되는 훅.
+   *  매니저는 호출 후 AwaitingCommand로 진입한다. */
+  readonly onCancelComposition?: () => void;
 }
 
 /** 본 모듈의 공개 표면. */
@@ -103,6 +112,24 @@ export function createKeyboardManager(opts: KeyboardManagerOptions): KeyboardMan
     // keypress/keyup, 단독 modifier는 매니저가 손대지 않는다.
     if (event.type !== 'keydown') return true;
     if (isModifierOnly(event)) return true;
+
+    // IME composition 중에는 모든 일반 키 입력을 IME가 소화해야 한다 —
+    // 자모 한 글자가 keydown 단위로 들어와도 합성 결과는 compositionend
+    // 시점에 한 번에 들어온다. 예외: prefix(Ctrl+B). 합성을 취소하고
+    // AwaitingCommand로 진입한다. (spec § 04 §§ 183-185.)
+    const composing = opts.isComposing?.() === true;
+    if (composing) {
+      if (isPrefixKeyDown(event)) {
+        opts.onCancelComposition?.();
+        if (state !== 'awaiting') {
+          enterAwaiting();
+        }
+        return false;
+      }
+      // 그 외엔 IME가 처리하도록 통과시킨다 — 매니저는 절대 합성 중
+      // 키를 byte로 해석하지 않는다.
+      return true;
+    }
 
     if (state === 'idle') {
       if (isPrefixKeyDown(event)) {
