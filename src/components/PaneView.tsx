@@ -12,7 +12,10 @@
 // 6. `PaneExited` 이벤트가 도착하면 한 줄 텍스트로 알리고 종료 상태로 들어간다.
 
 import { FitAddon } from '@xterm/addon-fit';
-import { WebglAddon } from '@xterm/addon-webgl';
+// 실험: 한글 IME composition 위치 어긋남이 WebGL renderer의 cellWidth
+// 측정 불일치 때문인지 확인하기 위해 임시로 캔버스 renderer로 폴백.
+// 결과 확인 후 영구 결정 예정.
+// import { WebglAddon } from '@xterm/addon-webgl';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 
@@ -20,10 +23,18 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { base64ToBytes, utf8ToBase64 } from '@/lib/codec';
+import { base64ToBytes, bytesToBase64, utf8ToBase64 } from '@/lib/codec';
+import { createKeyboardManager } from '@/lib/keyboard';
 import { logger } from '@/lib/logger';
 import type { PaneId } from '@/lib/protocol';
-import { onPtyOutput, onServerEvent, ptyInput, resizePane } from '@/lib/server-client';
+import {
+  detachSession,
+  onPtyOutput,
+  onServerEvent,
+  ptyInput,
+  resizePane,
+} from '@/lib/server-client';
+import { useSessionStore } from '@/store/session';
 
 /**
  * Windows Terminal "Campbell" 팔레트 (`docs/spec/07-tray-and-gui.md`
@@ -70,6 +81,8 @@ interface PaneViewProps {
 export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const setAttached = useSessionStore((s) => s.setAttached);
+  const setPrefixActive = useSessionStore((s) => s.setPrefixActive);
   // i18n `t` 변경으로 effect가 재실행되지 않도록 ref로 빼서 항상 최신값만 본다.
   const tRef = useRef(t);
   useEffect(() => {
@@ -81,7 +94,11 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
     if (!container) return;
 
     const term = new Terminal({
-      fontFamily: '"Cascadia Mono", "Consolas", "Courier New", monospace',
+      // 한글 등 CJK 글리프는 라틴 폰트에 없으므로 spec § accessibility.md
+      // §118의 폴백 체인을 따라간다. CJK 폰트의 advance가 라틴 셀 너비와
+      // 맞아야 IME composition이 셀 경계 밖으로 삐져 보이지 않는다.
+      fontFamily:
+        '"Cascadia Code", "Cascadia Mono", "Consolas", "D2Coding", "Malgun Gothic", "Noto Sans Mono CJK KR", monospace',
       fontSize: 14,
       cursorBlink: true,
       theme: CAMPBELL_THEME,
@@ -94,13 +111,13 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
 
     term.open(container);
 
-    try {
-      const webgl = new WebglAddon();
-      term.loadAddon(webgl);
-    } catch (e) {
-      // WebGL 사용이 불가능하면 캔버스 렌더러로 자연스럽게 폴백된다.
-      logger.warn('xterm.webgl.unavailable', { error: String(e) });
-    }
+    // 실험: WebGL 비활성화 (위 주석 참조). 캔버스 renderer로만 동작.
+    // try {
+    //   const webgl = new WebglAddon();
+    //   term.loadAddon(webgl);
+    // } catch (e) {
+    //   logger.warn('xterm.webgl.unavailable', { error: String(e) });
+    // }
 
     try {
       fit.fit();
@@ -128,6 +145,33 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
     const dataDisposable = term.onData((data) => {
       void ptyInput(paneId, utf8ToBase64(data));
     });
+
+    // tmux-style prefix 키 매니저. xterm.js의 custom key handler 위에 얹어
+    // prefix(Ctrl+B)와 그 뒤의 명령 키를 가로챈다. action 디스패치는 본
+    // closure가 책임지고, 매니저는 IPC를 직접 호출하지 않는다 — 그래야
+    // 단위 테스트가 가능하다.
+    const manager = createKeyboardManager({
+      onAction: (action) => {
+        if (action.kind === 'detach') {
+          // detach: 서버는 attach 가드를 드롭하고 클라이언트는 store에서
+          // attached를 비워 SessionLauncher로 자동 복귀한다.
+          void detachSession()
+            .catch((e: unknown) => {
+              logger.warn('pane.detach.failed', { error: String(e) });
+            })
+            .finally(() => {
+              setAttached(null);
+            });
+          return;
+        }
+        // 'send-bytes' — Prefix Prefix 등 literal forwarding.
+        void ptyInput(paneId, bytesToBase64(action.bytes));
+      },
+      onStateChange: (state) => {
+        setPrefixActive(state === 'awaiting');
+      },
+    });
+    term.attachCustomKeyEventHandler(manager.handle);
 
     // PTY 출력 구독. pane_id가 다른 패널의 이벤트는 무시.
     let unlistenOutput: UnlistenFn | null = null;
@@ -173,6 +217,9 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
       disposed = true;
       observer.disconnect();
       dataDisposable.dispose();
+      manager.dispose();
+      // 패널이 사라질 때 prefix 인디케이터가 켜진 상태로 굳지 않도록.
+      setPrefixActive(false);
       if (unlistenOutput) unlistenOutput();
       if (unlistenEvent) unlistenEvent();
       term.dispose();
@@ -180,7 +227,7 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
     // 스냅샷이 바뀌었다는 것은 새 어태치라는 뜻이므로 effect를 재실행해
     // 깨끗한 Terminal에 새 화면을 그리도록 둔다. (보통 paneId가 같이 바뀌므로
     // 어느 deps로 트리거되든 결과는 같다.)
-  }, [paneId, initialSnapshotBase64]);
+  }, [paneId, initialSnapshotBase64, setAttached, setPrefixActive]);
 
   return (
     <div

@@ -13,14 +13,20 @@ interface SessionState {
   attached: AttachOutcome | null;
   /** 마지막으로 알려진 서버 상태. 초기값은 `connecting`. */
   status: ServerStatus;
+  /** prefix 키가 눌린 직후 다음 명령 키를 기다리는 중이면 `true`.
+   *  StatusBar의 인디케이터가 본 값을 본다 (spec § 04 § State Machine). */
+  prefixActive: boolean;
 
   setAttached(outcome: AttachOutcome | null): void;
   setStatus(status: ServerStatus): void;
+  setPrefixActive(active: boolean): void;
 }
 
 export const useSessionStore = create<SessionState>((set) => ({
   attached: null,
   status: { state: 'connecting' },
+  prefixActive: false,
   setAttached: (outcome) => set({ attached: outcome }),
   setStatus: (status) => set({ status }),
+  setPrefixActive: (active) => set({ prefixActive: active }),
 }));

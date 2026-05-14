@@ -5,7 +5,8 @@
   "status": {
     "connecting": "Connecting to server…",
     "connected": "Connected to server v{{version}}",
-    "disconnected": "Disconnected: {{reason}}"
+    "disconnected": "Disconnected: {{reason}}",
+    "prefixActive": "prefix"
   },
   "launcher": {
     "title": "No session attached",
