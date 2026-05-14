@@ -690,32 +690,28 @@ where
     Ok(())
 }
 
-/// 한 세션의 모든 패널에 대해 `PtyEvent → ServerMessage` 변환 task와
-/// `VtermEvent → ServerMessage` 변환 task를 함께 띄운다. 두 task 모두
-/// attach guard가 drop되면 abort된다.
+/// 한 세션의 모든 패널에 대해 `PtyEvent → ServerMessage` 변환 task를 띄운다.
+/// task는 attach guard가 drop되면 abort된다.
+///
+/// Q1의 `VtermEvent → PaneCursorVisibility` forwarder는 일단 spawn하지
+/// 않는다 (handle_client의 `biased` select가 `forward_rx.recv()`를 항상
+/// 우선 polling하는데, PSReadLine 같은 셸이 한글 입력 시 cursor visibility
+/// 시퀀스 `ESC[?25l`/`ESC[?25h`를 빠르게 토글하면 `PaneCursorVisibility`
+/// 메시지가 mpsc에 누적되어 `read_until` 분기가 starve → `PtyInput`이
+/// 처리되지 않는 회귀를 일으킨다). `spawn_vterm_feeder`의 cursor visibility
+/// 추적 인프라는 그대로 두되 클라이언트로의 forward만 끊는다.
 fn spawn_forwarders(
     registry: &SharedRegistry,
     session_id: &SessionId,
     forward_tx: &mpsc::Sender<ServerMessage>,
 ) -> Vec<JoinHandle<()>> {
-    let reg = lock_registry(registry);
-    let ptys = reg.ptys_for_session(session_id);
-    let vterm_events = reg.vterm_event_senders_for_session(session_id);
-    drop(reg);
-
-    let mut handles = Vec::with_capacity(ptys.len() + vterm_events.len());
+    let ptys = lock_registry(registry).ptys_for_session(session_id);
+    let mut handles = Vec::with_capacity(ptys.len());
     for (pane_id, pty) in ptys {
         let rx = pty.subscribe();
         let tx = forward_tx.clone();
         handles.push(tokio::spawn(async move {
             forward_pane_events(pane_id, rx, tx).await;
-        }));
-    }
-    for (pane_id, sender) in vterm_events {
-        let rx = sender.subscribe();
-        let tx = forward_tx.clone();
-        handles.push(tokio::spawn(async move {
-            forward_pane_vterm_events(pane_id, rx, tx).await;
         }));
     }
     handles
@@ -1101,7 +1097,10 @@ fn spawn_vterm_feeder(
 }
 
 /// 한 패널의 [`VtermEvent`] 스트림을 평면 [`ServerMessage`] variant로 변환해
-/// 클라이언트별 forward 채널로 흘려보낸다. attach forwarder의 일부.
+/// 클라이언트별 forward 채널로 흘려보낸다. 본 함수는 현재 호출되지 않지만,
+/// Q1 follow-up(biased select 구조 개선 + PaneCursorVisibility 재배선) 작업
+/// 까지 인프라를 유지하기 위해 dead_code를 허용한다.
+#[allow(dead_code)]
 async fn forward_pane_vterm_events(
     pane_id: PaneId,
     mut rx: broadcast::Receiver<VtermEvent>,
