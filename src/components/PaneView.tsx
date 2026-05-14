@@ -25,7 +25,7 @@ import { useTranslation } from 'react-i18next';
 
 import { base64ToBytes, bytesToBase64, utf8ToBase64 } from '@/lib/codec';
 import { createImeManager } from '@/lib/ime';
-import type { ImeAnchorMode, ImeManager } from '@/lib/ime';
+import type { ImeManager } from '@/lib/ime';
 import { createKeyboardManager } from '@/lib/keyboard';
 import { logger } from '@/lib/logger';
 import type { PaneId } from '@/lib/protocol';
@@ -90,13 +90,6 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
   useEffect(() => {
     tRef.current = t;
   }, [t]);
-  // IME overlay anchor 모드. 서버의 PaneCursorVisibility 이벤트로 갱신된다.
-  // - PTY cursor 가시(기본 셸): helper-textarea(=PTY cursor 셀) 추적.
-  // - PTY cursor 숨김(ESC[?25l; claude/lazygit/htop/btop 같은 TUI):
-  //   helper-textarea가 의미 없는 위치에 머무르므로 패널 bottom-left로 전환.
-  // baseline은 'textarea' — 서버도 같은 baseline에서 시작해 전이가 일어날
-  // 때만 이벤트를 발사한다.
-  const imeAnchorRef = useRef<ImeAnchorMode>('textarea');
 
   useEffect(() => {
     const container = containerRef.current;
@@ -168,9 +161,10 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
     // 환경에서 측정 오차로 한 칸 어긋나 보이는 문제가 있어, 같은 좌표계를
     // 따라가는 자체 overlay로 대체한다(spec § 04 §§ 191-198).
     //
-    // TUI 앱(`ESC[?25l`로 PTY cursor 숨김)에 대비해 anchor 모드를 ref에서
-    // 매번 읽어 온다. ref는 PaneCursorVisibility 이벤트로 토글되며, mount
-    // 시점의 기본값은 'textarea'다.
+    // 단, TUI 앱(`ESC[?25l`로 PTY cursor를 숨기는 경우)에서는 합성 위치가
+    // 화면상의 caret과 다른 셀에 표시될 수 있다 — overlay는 PTY cursor에
+    // 앵커링되기 때문이다. 이 케이스는 별도 IPC가 필요해 후속 작업으로
+    // 남긴다. (`docs/known-issues.md` 후보.)
     let ime: ImeManager | null = null;
     if (term.element && term.textarea) {
       ime = createImeManager({
@@ -178,17 +172,12 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
         overlayParent: term.element,
         fontFamily,
         fontSize,
-        getAnchorMode: () => imeAnchorRef.current,
       });
     } else {
       logger.warn('pane.ime.disabled', {
         reason: 'term.element or term.textarea is undefined after open()',
       });
     }
-    // 새 PaneRuntime마다 baseline은 'textarea'로 초기화한다. 이전 attach
-    // 에서 'pane-bottom-left'로 둔 상태가 잔존하면 새 셸의 첫 출력이
-    // 어색한 위치에 앵커될 수 있다.
-    imeAnchorRef.current = 'textarea';
 
     // tmux-style prefix 키 매니저. xterm.js의 custom key handler 위에 얹어
     // prefix(Ctrl+B)와 그 뒤의 명령 키를 가로챈다. action 디스패치는 본
@@ -239,25 +228,11 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
       else unlistenOutput = fn;
     });
 
-    // server:event 구독. 본 PaneView가 관심 있는 변종만 골라 처리한다.
-    // 다른 이벤트(WindowClosed, SessionRenamed 등)는 무시 — 다른 컴포넌트가
-    // 자체 구독을 가진다. CLAUDE.md Rule 10: 새 variant도 알 수 없는 형태가
-    // 아니라 type-checked union이므로 silent ignore가 아닌 explicit pass다.
+    // PaneExited 이벤트 — 종료 코드 표시.
     void onServerEvent((evt) => {
-      if (evt.type === 'PaneExited') {
-        if (evt.pane_id !== paneId) return;
-        const msg = tRef.current('pane.exited', { code: evt.exit_code });
-        term.write(`\r\n${msg}\r\n`);
-        return;
-      }
-      if (evt.type === 'PaneCursorVisibility') {
-        if (evt.pane_id !== paneId) return;
-        // TUI 앱이 PTY cursor를 숨겼다면 anchor를 pane-bottom-left로,
-        // 다시 보이면 textarea로 복귀. IME composition이 진행 중이지
-        // 않더라도 다음 compositionupdate에 적용된다.
-        imeAnchorRef.current = evt.visible ? 'textarea' : 'pane-bottom-left';
-        return;
-      }
+      if (evt.type !== 'PaneExited' || evt.pane_id !== paneId) return;
+      const msg = tRef.current('pane.exited', { code: evt.exit_code });
+      term.write(`\r\n${msg}\r\n`);
     }).then((fn) => {
       if (disposed) fn();
       else unlistenEvent = fn;
