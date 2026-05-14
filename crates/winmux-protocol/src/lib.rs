@@ -22,7 +22,7 @@ pub use crate::errors::{ErrorCode, ErrorPayload, ProtocolError};
 pub use crate::identity::{IdentityError, UserIdentity};
 pub use crate::ids::{ClientId, IdError, MessageId, PaneId, SessionId, WindowId};
 pub use crate::messages::{
-    AttachTarget, ClientMessage, EventMessage, KillSessionTarget, PaneSnapshot, ServerMessage,
+    AttachTarget, ClientMessage, KillSessionTarget, PaneSnapshot, ServerMessage,
 };
 pub use crate::types::{
     ClientKind, CommandRequest, CommandResultPayload, NewSessionRequest, PaneSize, PaneSummary,

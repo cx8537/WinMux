@@ -29,9 +29,9 @@ use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use winmux_protocol::{
-    AttachTarget, ClientMessage, CommandRequest, CommandResultPayload, ErrorCode, EventMessage,
-    MessageId, NewSessionRequest, PROTOCOL_VERSION, PaneId, PaneSize, PaneSnapshot, ServerMessage,
-    SessionId, UserIdentity, WindowId, codec, decode_line,
+    AttachTarget, ClientMessage, CommandRequest, CommandResultPayload, ErrorCode, MessageId,
+    NewSessionRequest, PROTOCOL_VERSION, PaneId, PaneSize, PaneSnapshot, ServerMessage, SessionId,
+    UserIdentity, WindowId, codec, decode_line,
 };
 
 use crate::jobobj::JobObject;
@@ -40,8 +40,8 @@ use crate::pipe::handshake::{perform_handshake, send_error_message, send_server_
 use crate::pipe::security::verify_client_user;
 use crate::pty::{Pty, PtyEvent, SpawnRequest};
 use crate::session::{
-    PaneRuntime, Registry, RegistryError, SharedRegistry, VtermFeederHandle, new_pane_id,
-    new_session_id, new_window_id,
+    PaneRuntime, Registry, RegistryError, SharedRegistry, VtermEvent, VtermFeederHandle,
+    new_pane_id, new_session_id, new_vterm_event_channel, new_window_id,
 };
 use crate::terminal::VirtualTerm;
 
@@ -462,12 +462,19 @@ where
     };
 
     // 가상 터미널 + server-side feeder. feeder는 PTY broadcast를 구독해
-    // vterm을 누적 갱신한다 — reattach 시 snapshot()이 정확하도록.
+    // vterm을 누적 갱신한다 — reattach 시 snapshot()이 정확하도록. 동시에
+    // vterm 파생 이벤트(예: 커서 가시성 전이)를 별도 broadcast로 발사한다.
     let vterm = Arc::new(TokioMutex::new(VirtualTerm::new(
         DEFAULT_PANE_ROWS,
         DEFAULT_PANE_COLS,
     )));
-    let feeder = spawn_vterm_feeder(pane_id.clone(), pty.subscribe(), vterm.clone());
+    let vterm_events = new_vterm_event_channel();
+    let feeder = spawn_vterm_feeder(
+        pane_id.clone(),
+        pty.subscribe(),
+        vterm.clone(),
+        vterm_events.clone(),
+    );
 
     let runtime = PaneRuntime {
         pane_id: pane_id.clone(),
@@ -475,6 +482,7 @@ where
         session_id: session_id.clone(),
         pty,
         vterm,
+        vterm_events,
         _vterm_feeder: VtermFeederHandle::new(feeder),
     };
 
@@ -682,19 +690,32 @@ where
     Ok(())
 }
 
-/// 한 세션의 모든 패널에 대해 `PtyEvent → ServerMessage` 변환 task를 띄운다.
+/// 한 세션의 모든 패널에 대해 `PtyEvent → ServerMessage` 변환 task와
+/// `VtermEvent → ServerMessage` 변환 task를 함께 띄운다. 두 task 모두
+/// attach guard가 drop되면 abort된다.
 fn spawn_forwarders(
     registry: &SharedRegistry,
     session_id: &SessionId,
     forward_tx: &mpsc::Sender<ServerMessage>,
 ) -> Vec<JoinHandle<()>> {
-    let ptys = lock_registry(registry).ptys_for_session(session_id);
-    let mut handles = Vec::with_capacity(ptys.len());
+    let reg = lock_registry(registry);
+    let ptys = reg.ptys_for_session(session_id);
+    let vterm_events = reg.vterm_event_senders_for_session(session_id);
+    drop(reg);
+
+    let mut handles = Vec::with_capacity(ptys.len() + vterm_events.len());
     for (pane_id, pty) in ptys {
         let rx = pty.subscribe();
         let tx = forward_tx.clone();
         handles.push(tokio::spawn(async move {
             forward_pane_events(pane_id, rx, tx).await;
+        }));
+    }
+    for (pane_id, sender) in vterm_events {
+        let rx = sender.subscribe();
+        let tx = forward_tx.clone();
+        handles.push(tokio::spawn(async move {
+            forward_pane_vterm_events(pane_id, rx, tx).await;
         }));
     }
     handles
@@ -1028,18 +1049,46 @@ fn resolve_send_keys_target(
 /// 스냅샷이 정확하도록 만든다. 본 task는 `PaneRuntime`이 살아있는 동안만
 /// 돌아야 하므로 [`VtermFeederHandle`]에 감싸 RAII로 abort된다.
 ///
+/// 매 feed 후 vterm의 커서 가시성(DECTCEM)을 마지막으로 emit한 값과 비교해
+/// 전이가 있을 때만 [`VtermEvent::CursorVisibilityChanged`]를 발사한다. 초기
+/// 상태(visible = true)는 암묵적 baseline으로 두고 이벤트를 보내지 않는다 —
+/// 세션 시작마다 무의미한 이벤트로 클라이언트를 깨우지 않기 위해서다.
+/// 클라이언트도 같은 baseline(`textarea` 앵커 모드)으로 기본값을 잡는다.
+///
 /// CLAUDE.md Rule 1: 본 feeder는 받은 바이트 어떤 것도 로그하지 않는다.
 fn spawn_vterm_feeder(
     pane_id: PaneId,
     mut rx: broadcast::Receiver<PtyEvent>,
     vterm: Arc<TokioMutex<VirtualTerm>>,
+    vterm_events: broadcast::Sender<VtermEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // 초기 baseline. DECTCEM의 기본값은 SHOW_CURSOR(가시)이므로 true에서
+        // 시작한다. 비교는 last_visible과 현재 visibility 사이에서만 일어난다.
+        let mut last_visible: bool = true;
         loop {
             match rx.recv().await {
                 Ok(PtyEvent::Output(bytes)) => {
-                    let mut vt = vterm.lock().await;
-                    vt.feed(&bytes);
+                    let current_visible = {
+                        let mut vt = vterm.lock().await;
+                        vt.feed(&bytes);
+                        vt.cursor_visible()
+                    };
+                    if current_visible != last_visible {
+                        last_visible = current_visible;
+                        // 활성 receiver가 없으면 send는 Err를 돌려준다 — 첫
+                        // attach 전이거나 detach 직후 등. 어느 쪽이든 다음
+                        // attach가 fresh baseline(true)에서 다시 동기화되므로
+                        // 무시해도 안전하다.
+                        let _ = vterm_events.send(VtermEvent::CursorVisibilityChanged {
+                            visible: current_visible,
+                        });
+                        debug!(
+                            %pane_id,
+                            visible = current_visible,
+                            "vterm.cursor_visibility.transition"
+                        );
+                    }
                 }
                 Ok(PtyEvent::Exited { .. }) => break,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1049,6 +1098,33 @@ fn spawn_vterm_feeder(
             }
         }
     })
+}
+
+/// 한 패널의 [`VtermEvent`] 스트림을 평면 [`ServerMessage`] variant로 변환해
+/// 클라이언트별 forward 채널로 흘려보낸다. attach forwarder의 일부.
+async fn forward_pane_vterm_events(
+    pane_id: PaneId,
+    mut rx: broadcast::Receiver<VtermEvent>,
+    forward_tx: mpsc::Sender<ServerMessage>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(VtermEvent::CursorVisibilityChanged { visible }) => {
+                let msg = ServerMessage::PaneCursorVisibility {
+                    v: PROTOCOL_VERSION,
+                    pane_id: pane_id.clone(),
+                    visible,
+                };
+                if forward_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(dropped = n, %pane_id, "vterm.events.broadcast.lagged");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 /// 어태치 응답에 들어갈 [`PaneSnapshot`] 벡터를 만든다. 각 vterm에서 짧게
@@ -1087,13 +1163,10 @@ async fn forward_pane_events(
                 }
             }
             Ok(PtyEvent::Exited { code }) => {
-                let msg = ServerMessage::Event {
+                let msg = ServerMessage::PaneExited {
                     v: PROTOCOL_VERSION,
-                    event: EventMessage::PaneExited {
-                        v: PROTOCOL_VERSION,
-                        pane_id: pane_id.clone(),
-                        exit_code: code.unwrap_or(-1),
-                    },
+                    pane_id: pane_id.clone(),
+                    exit_code: code.unwrap_or(-1),
                 };
                 let _ = forward_tx.send(msg).await;
                 break;

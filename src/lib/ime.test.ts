@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createImeManager } from '@/lib/ime';
-import type { ImeManager } from '@/lib/ime';
+import type { ImeAnchorMode, ImeManager } from '@/lib/ime';
 import type { KeyboardAction, KeyboardState } from '@/lib/keyboard';
 import { createKeyboardManager } from '@/lib/keyboard';
 
@@ -231,6 +231,86 @@ describe('createImeManager', () => {
     fx.ime.cancelComposition();
     expect(fx.textarea.__calls.blur).toBe(0);
     expect(fx.textarea.__calls.focus).toBe(0);
+  });
+
+  it('overlay anchor switches between textarea and pane-bottom-left across layout passes', () => {
+    // 본 테스트는 spec § 04 §§ 191-198의 후속 작업(TUI caret-aware anchor)을 검증한다.
+    // 일반 셸이면 helper-textarea rect(=PTY cursor 셀)를 따라가고, TUI 앱이
+    // `ESC[?25l`로 PTY cursor를 숨기면 패널 bottom-left 고정 좌표로 전환한다.
+    const restoreDocument = installDocumentShim();
+    try {
+      const textarea = makeTextareaStub();
+      const parent = makeParentStub();
+      let mode: ImeAnchorMode = 'textarea';
+      const ime = createImeManager({
+        textarea,
+        overlayParent: parent,
+        fontFamily: 'monospace',
+        fontSize: 14,
+        getAnchorMode: () => mode,
+      });
+      try {
+        // 1) textarea 모드 — taRect(left=100, top=200), parentRect(left=0, top=0)
+        //    overlay.left = 100, overlay.top = 200.
+        textarea.dispatchEvent(compEvent('compositionstart', ''));
+        textarea.dispatchEvent(compEvent('compositionupdate', '가'));
+        const overlay = parent.appended;
+        expect(overlay).not.toBeNull();
+        if (overlay === null) throw new Error('overlay must be appended');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const style = (overlay as any).style as Record<string, string>;
+        expect(style.left).toBe('100px');
+        expect(style.top).toBe('200px');
+
+        // 2) PTY cursor 숨김 전이 — anchor 모드 전환 후 다음 update에서
+        //    overlay는 parent의 bottom-left + inset으로 이동해야 한다.
+        //    parent.height = 600, fontSize = 14 → lineHeight = 18,
+        //    inset = 8 → top = 600 - 18 - 8 = 574, left = 8.
+        mode = 'pane-bottom-left';
+        textarea.dispatchEvent(compEvent('compositionupdate', '간'));
+        expect(style.left).toBe('8px');
+        expect(style.top).toBe('574px');
+
+        // 3) 다시 가시 상태로 — overlay는 즉시 textarea rect로 복귀.
+        mode = 'textarea';
+        textarea.dispatchEvent(compEvent('compositionupdate', '강'));
+        expect(style.left).toBe('100px');
+        expect(style.top).toBe('200px');
+      } finally {
+        ime.dispose();
+      }
+    } finally {
+      restoreDocument();
+    }
+  });
+
+  it('overlay defaults to textarea anchor when getAnchorMode is not supplied', () => {
+    const restoreDocument = installDocumentShim();
+    try {
+      const textarea = makeTextareaStub();
+      const parent = makeParentStub();
+      const ime = createImeManager({
+        textarea,
+        overlayParent: parent,
+        fontFamily: 'monospace',
+        fontSize: 14,
+      });
+      try {
+        textarea.dispatchEvent(compEvent('compositionstart', ''));
+        textarea.dispatchEvent(compEvent('compositionupdate', '가'));
+        const overlay = parent.appended;
+        if (overlay === null) throw new Error('overlay must be appended');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const style = (overlay as any).style as Record<string, string>;
+        // taRect(100,200) - parentRect(0,0) = (100,200).
+        expect(style.left).toBe('100px');
+        expect(style.top).toBe('200px');
+      } finally {
+        ime.dispose();
+      }
+    } finally {
+      restoreDocument();
+    }
   });
 
   it('dispose removes the overlay and detaches listeners', () => {

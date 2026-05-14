@@ -16,6 +16,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 use winmux_protocol::{
@@ -157,6 +158,30 @@ pub struct AttachResult {
     pub panes: Vec<PaneSummary>,
 }
 
+/// vterm 상태에서 파생되는 이벤트.
+///
+/// PTY 바이트 스트림 자체와 다르게, 본 enum은 alacritty가 파싱한 결과
+/// (DECTCEM 등 internal mode 변화)에서 만들어진다. `spawn_vterm_feeder`가
+/// 매 PTY 출력 chunk를 feed한 뒤 vterm 상태 변화를 비교해 emit한다.
+///
+/// 본 채널은 패널 lifecycle 동안만 살아 있다 — [`PaneRuntime`] drop과 함께
+/// 사라진다. CLAUDE.md Rule 1: 페이로드 어느 변종도 PTY 콘텐츠를 담지 않는다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VtermEvent {
+    /// PTY 커서 가시성(DECTCEM)이 바뀌었다. 트레이는 IME composition overlay의
+    /// anchor를 전환하는 데 쓴다.
+    CursorVisibilityChanged {
+        /// 새 가시성 상태(true=표시, false=숨김).
+        visible: bool,
+    },
+}
+
+/// 한 패널의 vterm-derived 이벤트 채널 capacity.
+///
+/// DECTCEM 토글은 TUI 앱이 입출력 중에 거의 발생하지 않는다(셸 시작/종료,
+/// 풀스크린 입출력 모드 전환 시 정도). 16개면 일시적 폭주에도 충분하다.
+const VTERM_EVENT_QUEUE: usize = 16;
+
 /// 한 패널의 런타임 자원. 메타데이터([`PaneState`])와 동일한 lifecycle.
 ///
 /// `vterm`은 PTY 출력 broadcast를 server-side에서 별도로 구독해 갱신하는
@@ -173,11 +198,22 @@ pub struct PaneRuntime {
     pub pty: Arc<Pty>,
     /// 가상 터미널 상태. snapshot/resize 시 lock하므로 `tokio::Mutex`.
     pub vterm: Arc<TokioMutex<VirtualTerm>>,
+    /// vterm-derived 이벤트(예: CursorVisibilityChanged) broadcast 송신부.
+    /// feeder task가 발사하고, attach forwarder가 구독한다.
+    pub vterm_events: broadcast::Sender<VtermEvent>,
     /// `vterm.feed`를 구동하는 백그라운드 task. Drop 시 abort.
     ///
     /// 필드 자체는 다른 곳에서 참조되지 않지만 RAII로 핸들을 들고 있어야
     /// PaneRuntime이 drop될 때 feeder task가 abort된다.
     pub _vterm_feeder: VtermFeederHandle,
+}
+
+/// 새 `VtermEvent` broadcast 채널을 만든다. 생성자는 송신부만 보관하고
+/// receiver는 forwarder 등 구독자가 [`broadcast::Sender::subscribe`]로 얻는다.
+#[must_use]
+pub fn new_vterm_event_channel() -> broadcast::Sender<VtermEvent> {
+    let (tx, _rx) = broadcast::channel(VTERM_EVENT_QUEUE);
+    tx
 }
 
 /// `PaneRuntime`이 drop되면 자동으로 abort되는 task 핸들 wrapper.
@@ -359,6 +395,36 @@ impl Registry {
     #[must_use]
     pub fn vterm_for_pane(&self, pane_id: &PaneId) -> Option<Arc<TokioMutex<VirtualTerm>>> {
         self.pane_runtimes.get(pane_id).map(|r| r.vterm.clone())
+    }
+
+    /// 한 패널의 vterm-event sender를 빌려준다(있으면). forwarder가
+    /// `subscribe()`해서 receiver를 만든다.
+    #[must_use]
+    pub fn vterm_events_for_pane(&self, pane_id: &PaneId) -> Option<broadcast::Sender<VtermEvent>> {
+        self.pane_runtimes
+            .get(pane_id)
+            .map(|r| r.vterm_events.clone())
+    }
+
+    /// 한 세션의 모든 (패널-ID, vterm-event sender) 쌍을 모은다. attach 시
+    /// 클라이언트마다 forwarder를 띄울 때 쓴다.
+    #[must_use]
+    pub fn vterm_event_senders_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Vec<(PaneId, broadcast::Sender<VtermEvent>)> {
+        let Some(session) = self.sessions.get(session_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for window in &session.windows {
+            for pane in &window.panes {
+                if let Some(rt) = self.pane_runtimes.get(&pane.id) {
+                    out.push((pane.id.clone(), rt.vterm_events.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// 한 세션의 모든 (패널-ID, PTY) 쌍을 모은다 — broadcast forwarder 등록에 쓴다.

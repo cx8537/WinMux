@@ -116,7 +116,8 @@ export type EventPayload =
   | { type: 'WindowClosed'; v: number; window_id: WindowId }
   | { type: 'SessionRenamed'; v: number; session_id: SessionId; name: string }
   | { type: 'PaneTitleChanged'; v: number; pane_id: PaneId; title: string }
-  | { type: 'AlertBell'; v: number; pane_id: PaneId };
+  | { type: 'AlertBell'; v: number; pane_id: PaneId }
+  | { type: 'PaneCursorVisibility'; v: number; pane_id: PaneId; visible: boolean };
 
 // ---------------------------------------------------------------------------
 // Tauri command 오류

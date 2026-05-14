@@ -28,6 +28,27 @@
 
 import { logger } from '@/lib/logger';
 
+/**
+ * Overlay anchor strategy. 매 레이아웃 패스마다 `getAnchorMode()`로 조회된다.
+ *
+ * - `'textarea'` (기본값): xterm의 helper-textarea rect를 따라간다. 일반 셸은
+ *   PTY 커서 셀과 helper-textarea가 일치하므로 시각적 caret과 맞물린다.
+ * - `'pane-bottom-left'`: TUI 앱이 `ESC[?25l`로 PTY 커서를 숨긴 경우(claude,
+ *   lazygit, htop, btop 등) 자체 caret을 그릴 수 있는 어디든 그릴 수 있어
+ *   helper-textarea의 위치는 의미가 없다. 그 대신 overlayParent의 bottom-left
+ *   에 작은 inset을 두고 anchor한다.
+ *
+ *   bottom-left를 고른 이유:
+ *   1. 입력은 화면 흐름의 가장 최근 출력 아래에서 일어나는 것이 자연스럽다.
+ *      터미널 사용자는 본질적으로 마지막 출력 직후에 caret을 기대한다.
+ *   2. TUI 앱은 보통 화면 상단에 정보 패널/리스트를 채우고 아래쪽에는
+ *      status bar 한 줄만 둔다. bottom-left는 그 status bar와 겹치는 정도가
+ *      가장 적은 영역이다.
+ *   3. top-left는 풀스크린 TUI의 헤더(예: lazygit의 staged/unstaged 탭)와
+ *      충돌하기 쉽다.
+ */
+export type ImeAnchorMode = 'textarea' | 'pane-bottom-left';
+
 /** ImeManager 생성 옵션. */
 export interface ImeManagerOptions {
   /** xterm.js 가 만들어 둔 input textarea. compositionstart 등 native
@@ -40,6 +61,13 @@ export interface ImeManagerOptions {
   readonly fontFamily: string;
   /** xterm.js의 fontSize(px). overlay 가독성 일관성 확보. */
   readonly fontSize: number;
+  /** 매 레이아웃 패스마다 호출되어 overlay anchor 전략을 결정한다.
+   *
+   *  미지정 시 항상 `'textarea'` (M1.5까지의 기본 동작). PaneView는 server에서
+   *  오는 `PaneCursorVisibility` 이벤트를 받아 본 콜백이 반환하는 값을 그때
+   *  그때 전환한다. ImeManager 자체는 상태를 보관하지 않고 매번 새로 조회만
+   *  한다 — 호출자가 캐싱 책임을 진다 (`useRef` 등). */
+  readonly getAnchorMode?: () => ImeAnchorMode;
   /** 합성 시작 알림. 외부(예: status indicator)에서 활용. */
   readonly onCompositionStart?: () => void;
   /** 합성 진행 중 텍스트 갱신. */
@@ -89,18 +117,38 @@ export function createImeManager(opts: ImeManagerOptions): ImeManager {
   // 명시 — 전역 CSS를 건드리지 않고 인스턴스별로 한정.
   hideXtermBuiltInCompositionView(opts.overlayParent);
 
+  /** TUI 앱(`ESC[?25l`로 PTY cursor를 숨긴 경우) 모드에서 사용하는 inset(px).
+   *  너무 작으면 패널 경계선과 겹쳐 보이고, 너무 크면 status bar가 들어찰 공간을
+   *  잠식한다. xterm.js 셀 한 칸이 보통 8~10px이므로 비슷한 수준이 자연스럽다. */
+  const PANE_BOTTOM_LEFT_INSET_PX = 8;
+
   function showOverlay(text: string): void {
     overlay.textContent = text;
     if (text.length === 0) {
       overlay.style.display = 'none';
       return;
     }
-    // textarea가 xterm CompositionHelper.updateCompositionElements에
-    // 의해 PTY cursor 셀로 이동된 후의 rect를 기준 좌표로 삼는다. 같은
-    // 렌더러 좌표계라 셀 경계와 정확히 맞는다.
-    const taRect = opts.textarea.getBoundingClientRect();
     const parentRect = opts.overlayParent.getBoundingClientRect();
+    const mode: ImeAnchorMode = opts.getAnchorMode ? opts.getAnchorMode() : 'textarea';
     overlay.style.display = 'block';
+    if (mode === 'pane-bottom-left') {
+      // PTY cursor가 숨어 있어 helper-textarea의 위치가 의미 없는 케이스.
+      // overlayParent의 bottom-left 근처에 anchor한다. overlay의 자체 높이는
+      // lineHeight = fontSize + 4 (applyOverlayBaseStyle 참고)로 가정한다.
+      const overlayLineHeight = opts.fontSize + 4;
+      const left = PANE_BOTTOM_LEFT_INSET_PX;
+      const top = Math.max(
+        0,
+        parentRect.height - overlayLineHeight - PANE_BOTTOM_LEFT_INSET_PX,
+      );
+      overlay.style.left = `${left}px`;
+      overlay.style.top = `${top}px`;
+      return;
+    }
+    // 'textarea' (default): textarea가 xterm CompositionHelper에 의해 PTY cursor
+    // 셀로 이동된 후의 rect를 기준 좌표로 삼는다. 같은 렌더러 좌표계라 셀
+    // 경계와 정확히 맞는다.
+    const taRect = opts.textarea.getBoundingClientRect();
     overlay.style.left = `${taRect.left - parentRect.left}px`;
     overlay.style.top = `${taRect.top - parentRect.top}px`;
   }

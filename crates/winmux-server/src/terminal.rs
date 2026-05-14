@@ -17,6 +17,7 @@ use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::Config;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 
@@ -207,6 +208,17 @@ impl VirtualTerm {
         let rows = u16::try_from(g.screen_lines()).unwrap_or(u16::MAX);
         let cols = u16::try_from(g.columns()).unwrap_or(u16::MAX);
         (rows, cols)
+    }
+
+    /// PTY 커서가 현재 표시 모드인지(DECTCEM). 초기값은 `true`이며,
+    /// `ESC[?25l`로 false, `ESC[?25h`로 다시 true가 된다.
+    ///
+    /// 트레이가 IME composition overlay의 앵커를 결정할 때 쓰는 신호를
+    /// 만들어 내는 1차 소스. 본 함수는 grid·flag 변화 없이 한 비트만
+    /// 읽으므로 매 PTY 출력 chunk 직후 호출해도 비용이 사실상 0이다.
+    #[must_use]
+    pub fn cursor_visible(&self) -> bool {
+        self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 }
 
@@ -508,6 +520,34 @@ mod tests {
         let mut vt = VirtualTerm::new(10, 20);
         vt.resize(24, 80);
         assert_eq!(vt.dimensions(), (24, 80));
+    }
+
+    /// 초기 상태에서 `SHOW_CURSOR`는 alacritty의 default mode에 포함되므로 true.
+    /// `ESC[?25l`(DECTCEM disable)을 흘리면 false로 전이하고, `ESC[?25h`로 다시
+    /// true로 복원되는지 검증한다.
+    #[test]
+    fn cursor_visibility_tracks_dectcem_transitions() {
+        let mut vt = VirtualTerm::new(5, 10);
+        assert!(
+            vt.cursor_visible(),
+            "fresh VirtualTerm should start with cursor visible"
+        );
+
+        vt.feed(b"\x1b[?25l");
+        assert!(
+            !vt.cursor_visible(),
+            "ESC[?25l should hide the cursor (TUI apps like claude/lazygit do this)"
+        );
+
+        // ESC[?25l이 두 번 들어와도 상태는 false 유지.
+        vt.feed(b"\x1b[?25l");
+        assert!(!vt.cursor_visible());
+
+        vt.feed(b"\x1b[?25h");
+        assert!(
+            vt.cursor_visible(),
+            "ESC[?25h should restore cursor visibility"
+        );
     }
 
     #[test]
