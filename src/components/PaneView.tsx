@@ -91,7 +91,12 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
     if (!container) return;
 
     const term = new Terminal({
-      fontFamily: '"Cascadia Mono", "Consolas", "Courier New", monospace',
+      // CJK(한글/일본어/중국어) 글리프는 라틴 폰트에 없으므로
+      // `docs/nonfunctional/accessibility.md` §118의 폴백 체인을 따른다.
+      // Windows 11 기본 포함인 `Malgun Gothic`이 시스템 한글 글리프를
+      // 책임지고, 그 외 폰트는 사용자가 설치했을 때만 우선 사용된다.
+      fontFamily:
+        '"Cascadia Code", "Cascadia Mono", "Consolas", "D2Coding", "Malgun Gothic", "Noto Sans Mono CJK KR", monospace',
       fontSize: 14,
       cursorBlink: true,
       // 기본 block 커서는 직사각형이라 두꺼워 보인다. 2px 세로 선 스타일로
