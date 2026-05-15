@@ -10,9 +10,6 @@
 // 5. ResizeObserver로 컨테이너 크기 변화를 감지해 FitAddon으로 새 rows/cols를
 //    계산하고 `winmux_resize`를 호출.
 // 6. `PaneExited` 이벤트가 도착하면 한 줄 텍스트로 알리고 종료 상태로 들어간다.
-// 7. IME composition은 `createImeManager`에 위임한다. 매니저는 자체 overlay로
-//    합성 중 텍스트를 그리고, keyboard 매니저에 composing 상태를 노출해
-//    prefix(Ctrl+B) 가로채기와 충돌하지 않도록 한다 (spec § 04 §§ 191-198).
 
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
@@ -24,8 +21,6 @@ import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { base64ToBytes, bytesToBase64, utf8ToBase64 } from '@/lib/codec';
-import { createImeManager } from '@/lib/ime';
-import type { ImeManager } from '@/lib/ime';
 import { createKeyboardManager } from '@/lib/keyboard';
 import { logger } from '@/lib/logger';
 import type { PaneId } from '@/lib/protocol';
@@ -95,16 +90,9 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
     const container = containerRef.current;
     if (!container) return;
 
-    // 한글 등 CJK 글리프는 라틴 폰트에 없으므로 spec § accessibility.md
-    // §118의 폴백 체인을 따라간다. CJK 폰트의 advance가 라틴 셀 너비와
-    // 맞아야 IME composition이 셀 경계 밖으로 삐져 보이지 않는다.
-    const fontFamily =
-      '"Cascadia Code", "Cascadia Mono", "Consolas", "D2Coding", "Malgun Gothic", "Noto Sans Mono CJK KR", monospace';
-    const fontSize = 14;
-
     const term = new Terminal({
-      fontFamily,
-      fontSize,
+      fontFamily: '"Cascadia Mono", "Consolas", "Courier New", monospace',
+      fontSize: 14,
       cursorBlink: true,
       theme: CAMPBELL_THEME,
       scrollback: 10_000,
@@ -116,10 +104,6 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
 
     term.open(container);
 
-    // WebGL renderer는 페인트 성능상 기본 활성화. xterm 내장
-    // `.composition-view`의 cellWidth skew는 자체 IME overlay(아래)가
-    // PTY cursor 셀이 아닌 helper-textarea 좌표를 따라가도록 설계되어 있어
-    // composition 위치에 영향을 주지 않는다.
     try {
       const webgl = new WebglAddon();
       term.loadAddon(webgl);
@@ -155,30 +139,6 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
       void ptyInput(paneId, utf8ToBase64(data));
     });
 
-    // IME composition 매니저. xterm.js가 노출한 textarea에 직접 listener를
-    // 걸고, 자체 overlay로 합성 중 텍스트를 그린다. xterm 내장
-    // `.composition-view`는 PTY cursor 셀에 고정되는데 WebView2 + DPI
-    // 환경에서 측정 오차로 한 칸 어긋나 보이는 문제가 있어, 같은 좌표계를
-    // 따라가는 자체 overlay로 대체한다(spec § 04 §§ 191-198).
-    //
-    // 단, TUI 앱(`ESC[?25l`로 PTY cursor를 숨기는 경우)에서는 합성 위치가
-    // 화면상의 caret과 다른 셀에 표시될 수 있다 — overlay는 PTY cursor에
-    // 앵커링되기 때문이다. 이 케이스는 별도 IPC가 필요해 후속 작업으로
-    // 남긴다. (`docs/known-issues.md` 후보.)
-    let ime: ImeManager | null = null;
-    if (term.element && term.textarea) {
-      ime = createImeManager({
-        textarea: term.textarea,
-        overlayParent: term.element,
-        fontFamily,
-        fontSize,
-      });
-    } else {
-      logger.warn('pane.ime.disabled', {
-        reason: 'term.element or term.textarea is undefined after open()',
-      });
-    }
-
     // tmux-style prefix 키 매니저. xterm.js의 custom key handler 위에 얹어
     // prefix(Ctrl+B)와 그 뒤의 명령 키를 가로챈다. action 디스패치는 본
     // closure가 책임지고, 매니저는 IPC를 직접 호출하지 않는다 — 그래야
@@ -202,10 +162,6 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
       },
       onStateChange: (state) => {
         setPrefixActive(state === 'awaiting');
-      },
-      isComposing: () => ime?.isComposing() === true,
-      onCancelComposition: () => {
-        ime?.cancelComposition();
       },
     });
     term.attachCustomKeyEventHandler(manager.handle);
@@ -255,7 +211,6 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
       observer.disconnect();
       dataDisposable.dispose();
       manager.dispose();
-      if (ime) ime.dispose();
       // 패널이 사라질 때 prefix 인디케이터가 켜진 상태로 굳지 않도록.
       setPrefixActive(false);
       if (unlistenOutput) unlistenOutput();

@@ -386,16 +386,8 @@ async fn dispatch_server_message(app: &AppHandle, inner: &Inner, msg: ServerMess
                 warn!(error = %e, "tray.ipc.emit_pty_failed");
             }
         }
-        // 푸시 이벤트들은 평면 wire 구조를 그대로 webview로 흘려보낸다.
-        // ServerMessage variant의 직렬화 결과(`{"type":"PaneExited",...}`)가
-        // 트레이 webview의 `EventPayload` 정의와 곧바로 정합한다.
-        ref msg @ (ServerMessage::PaneExited { .. }
-        | ServerMessage::WindowClosed { .. }
-        | ServerMessage::SessionRenamed { .. }
-        | ServerMessage::PaneTitleChanged { .. }
-        | ServerMessage::AlertBell { .. }
-        | ServerMessage::PaneCursorVisibility { .. }) => {
-            if let Err(e) = app.emit("server:event", msg) {
+        ServerMessage::Event { event, .. } => {
+            if let Err(e) = app.emit("server:event", event) {
                 warn!(error = %e, "tray.ipc.emit_event_failed");
             }
         }
@@ -445,12 +437,7 @@ fn server_message_type(msg: &ServerMessage) -> &'static str {
         ServerMessage::CommandResult { .. } => "CommandResult",
         ServerMessage::Ok { .. } => "Ok",
         ServerMessage::PtyOutput { .. } => "PtyOutput",
-        ServerMessage::PaneExited { .. } => "PaneExited",
-        ServerMessage::WindowClosed { .. } => "WindowClosed",
-        ServerMessage::SessionRenamed { .. } => "SessionRenamed",
-        ServerMessage::PaneTitleChanged { .. } => "PaneTitleChanged",
-        ServerMessage::AlertBell { .. } => "AlertBell",
-        ServerMessage::PaneCursorVisibility { .. } => "PaneCursorVisibility",
+        ServerMessage::Event { .. } => "Event",
         ServerMessage::Error { .. } => "Error",
     }
 }

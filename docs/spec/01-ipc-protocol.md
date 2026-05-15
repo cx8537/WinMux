@@ -378,21 +378,11 @@ into its internal command enum and runs it.
 After successful attach, the client implicitly subscribes to events
 for the attached session.
 
-Events are flat `ServerMessage` variants — no outer `Event` wrapper.
-On the wire each event is `{"v":1,"type":"<Name>", …}` directly. The
-prior nested form caused a duplicate `type` key and is gone.
-
 - `PaneExited { pane_id, exit_code }`
 - `WindowClosed { window_id }`
 - `SessionRenamed { session_id, name }`
 - `PaneTitleChanged { pane_id, title }`
 - `AlertBell { pane_id }`
-- `PaneCursorVisibility { pane_id, visible }` — PTY cursor visibility
-  (DECTCEM) transitioned. The server emits this only on transitions; the
-  implicit baseline at session start is `visible: true`. Used by the tray
-  to anchor the IME composition overlay to the PTY cursor cell when the
-  cursor is visible (regular shells), and to a fixed pane-relative
-  position when hidden (TUI apps that draw their own caret).
 
 Events carry no `id`.
 

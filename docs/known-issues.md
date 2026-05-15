@@ -107,28 +107,19 @@ WinMux (please don't), things will break in interesting ways.
 
 ### AT-4. M0 snapshot emits glyphs only (no SGR)
 
-`VirtualTerm::snapshot` in M0 PoC re-emitted cell glyphs and final cursor
-position but discarded per-cell SGR state (foreground/background, bold,
-underline, etc.). Reattach therefore showed the same characters in the
+`VirtualTerm::snapshot` in M0 PoC re-emits cell glyphs and final cursor
+position but discards per-cell SGR state (foreground/background, bold,
+underline, etc.). Reattach therefore shows the same characters in the
 same positions but in default colors, until the next live PTY output
-re-painted with full attributes.
+re-paints with full attributes.
 
 **Rationale.** SGR diff serialization is a meaningful chunk of code and
-was not on the M0 acceptance path (`docs/spec/00-overview.md` only
-requires "detach and reattach show the previous screen"). Color-faithful
-snapshot was tracked for M1 alongside scrollback persistence.
+not on the M0 acceptance path (`docs/spec/00-overview.md` only requires
+"detach and reattach show the previous screen"). Color-faithful
+snapshot is tracked for M1 alongside scrollback persistence.
 
-**Workaround.** None needed for M0. Users who needed exact-color
-reattach could wait briefly for the shell to redraw.
-
-**Status.** Resolved in M1.5. `VirtualTerm::snapshot` now walks the grid
-and emits SGR transitions (named 16 colors, indexed 256, truecolor RGB;
-bold, dim, italic, underline, reverse, strikeout) only at style
-boundaries, then restores the cursor. Verified by two unit tests
-(`snapshot_round_trips_sgr_through_fresh_vterm`,
-`snapshot_round_trips_indexed_and_truecolor`) that feed the snapshot
-bytes back into a fresh `VirtualTerm` and assert per-cell fg/bg/attrs
-equality.
+**Workaround.** None needed for M0. Users who need exact-color
+reattach can wait briefly for the shell to redraw.
 
 ---
 

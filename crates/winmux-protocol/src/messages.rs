@@ -271,15 +271,58 @@ impl ClientMessage {
     }
 }
 
+/// 서버 → 클라이언트 이벤트 메시지(요청-응답이 아닌 푸시).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum EventMessage {
+    /// 셸이 종료되어 패널이 죽음.
+    PaneExited {
+        /// 프로토콜 버전.
+        v: u32,
+        /// 죽은 패널.
+        pane_id: PaneId,
+        /// 셸이 보고한 종료 코드.
+        exit_code: i32,
+    },
+
+    /// 윈도우가 닫힘.
+    WindowClosed {
+        /// 프로토콜 버전.
+        v: u32,
+        /// 닫힌 윈도우.
+        window_id: WindowId,
+    },
+
+    /// 세션 이름이 변경됨.
+    SessionRenamed {
+        /// 프로토콜 버전.
+        v: u32,
+        /// 대상 세션.
+        session_id: SessionId,
+        /// 새 이름.
+        name: String,
+    },
+
+    /// 패널 타이틀이 변경됨(OSC 0/2).
+    PaneTitleChanged {
+        /// 프로토콜 버전.
+        v: u32,
+        /// 대상 패널.
+        pane_id: PaneId,
+        /// 새 타이틀.
+        title: String,
+    },
+
+    /// 패널에서 BEL(`0x07`) 발생.
+    AlertBell {
+        /// 프로토콜 버전.
+        v: u32,
+        /// 발신 패널.
+        pane_id: PaneId,
+    },
+}
+
 /// 서버 → 클라이언트 메시지.
-///
-/// 푸시 이벤트(PaneExited, WindowClosed, SessionRenamed,
-/// PaneTitleChanged, AlertBell, PaneCursorVisibility)도 별도 wrapper
-/// 없이 본 enum의 variant로 직접 직렬화된다. 이전에는 `Event` wrapper와
-/// 내부 `EventMessage` enum의 이중 tag 구조였는데, 외부 `tag = "type"`과
-/// 내부 `tag = "type"`이 같은 JSON 객체에 두 번 적혀 역직렬화가 실패하는
-/// latent bug가 있었다(`serde_json` "duplicate field `type`"). 평면
-/// 구조로 합치면 트레이의 `EventPayload`와도 그대로 정합한다.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum ServerMessage {
@@ -367,73 +410,13 @@ pub enum ServerMessage {
         bytes_base64: String,
     },
 
-    // ---- 푸시 이벤트들 (요청-응답이 아닌 서버 발신) -----------------------
-    /// 셸이 종료되어 패널이 죽음.
-    PaneExited {
+    /// 푸시 이벤트.
+    Event {
         /// 프로토콜 버전.
         v: u32,
-        /// 죽은 패널.
-        pane_id: PaneId,
-        /// 셸이 보고한 종료 코드.
-        exit_code: i32,
-    },
-
-    /// 윈도우가 닫힘.
-    WindowClosed {
-        /// 프로토콜 버전.
-        v: u32,
-        /// 닫힌 윈도우.
-        window_id: WindowId,
-    },
-
-    /// 세션 이름이 변경됨.
-    SessionRenamed {
-        /// 프로토콜 버전.
-        v: u32,
-        /// 대상 세션.
-        session_id: SessionId,
-        /// 새 이름.
-        name: String,
-    },
-
-    /// 패널 타이틀이 변경됨(OSC 0/2).
-    PaneTitleChanged {
-        /// 프로토콜 버전.
-        v: u32,
-        /// 대상 패널.
-        pane_id: PaneId,
-        /// 새 타이틀.
-        title: String,
-    },
-
-    /// 패널에서 BEL(`0x07`) 발생.
-    AlertBell {
-        /// 프로토콜 버전.
-        v: u32,
-        /// 발신 패널.
-        pane_id: PaneId,
-    },
-
-    /// PTY 커서 가시성(DECTCEM)이 바뀌었다. `ESC[?25l`로 숨김 → `false`,
-    /// `ESC[?25h`로 다시 켜짐 → `true`.
-    ///
-    /// 트레이는 본 이벤트를 받아 IME composition overlay의 앵커를 전환한다.
-    /// 일반 셸은 PTY 커서가 화면상의 caret과 일치하므로 helper-textarea
-    /// 좌표(=PTY 커서 셀)를 그대로 따라가지만, TUI 앱(claude, lazygit,
-    /// htop, btop 등)은 `ESC[?25l`로 PTY 커서를 숨기고 자체 caret을 다른
-    /// 셀에 그린다. 그 상태에서 helper-textarea 좌표를 따라가면 overlay가
-    /// 의미 없는 위치에 뜨므로, 클라이언트는 가시성 = false일 때 패널 고정
-    /// 좌표(예: bottom-left)로 anchor를 바꾼다.
-    ///
-    /// 초기 상태(가시 = true)는 암묵적 baseline이며 서버는 전이가 일어날
-    /// 때만 이벤트를 발사한다. 같은 값이 반복돼도 스팸하지 않는다.
-    PaneCursorVisibility {
-        /// 프로토콜 버전.
-        v: u32,
-        /// 대상 패널.
-        pane_id: PaneId,
-        /// 새 가시성 상태. true = 커서 표시, false = 숨김.
-        visible: bool,
+        /// 이벤트 페이로드.
+        #[serde(flatten)]
+        event: EventMessage,
     },
 
     /// 오류 응답.
@@ -459,12 +442,7 @@ impl ServerMessage {
             | Self::CommandResult { v, .. }
             | Self::Ok { v, .. }
             | Self::PtyOutput { v, .. }
-            | Self::PaneExited { v, .. }
-            | Self::WindowClosed { v, .. }
-            | Self::SessionRenamed { v, .. }
-            | Self::PaneTitleChanged { v, .. }
-            | Self::AlertBell { v, .. }
-            | Self::PaneCursorVisibility { v, .. }
+            | Self::Event { v, .. }
             | Self::Error { v, .. } => *v,
         }
     }
@@ -524,53 +502,6 @@ mod tests {
         let bad = r#"{"v":1,"type":"Bye","extra":1}"#;
         let parsed: Result<ClientMessage, _> = serde_json::from_str(bad);
         assert!(parsed.is_err(), "unknown top-level field must be rejected");
-    }
-
-    #[test]
-    fn pane_cursor_visibility_event_roundtrips() {
-        let pane_id = PaneId::from_body("PANE-CVZ").expect("pane id");
-        let event = ServerMessage::PaneCursorVisibility {
-            v: PROTOCOL_VERSION,
-            pane_id: pane_id.clone(),
-            visible: false,
-        };
-        let json = serde_json::to_string(&event).expect("ser");
-        assert!(
-            json.contains("\"type\":\"PaneCursorVisibility\""),
-            "wire tag missing: {json}"
-        );
-        assert!(json.contains("\"visible\":false"));
-        let back: ServerMessage = serde_json::from_str(&json).expect("de");
-        assert_eq!(event, back);
-        match back {
-            ServerMessage::PaneCursorVisibility {
-                pane_id: pid,
-                visible,
-                ..
-            } => {
-                assert_eq!(pid, pane_id);
-                assert!(!visible);
-            }
-            other => panic!("expected PaneCursorVisibility, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn pane_exited_roundtrips() {
-        // 평면 wire 구조 회귀 가드. 예전 `Event` wrapper + 내부 `EventMessage`
-        // 조합이었을 때는 `"type"` 키가 두 번 등장해 역직렬화가 깨졌다.
-        let pane_id = PaneId::from_body("PANE-EXIT").expect("pane id");
-        let event = ServerMessage::PaneExited {
-            v: PROTOCOL_VERSION,
-            pane_id: pane_id.clone(),
-            exit_code: 137,
-        };
-        let json = serde_json::to_string(&event).expect("ser");
-        assert!(json.contains("\"type\":\"PaneExited\""));
-        // `type`이 한 번만 등장하는지 보호한다.
-        assert_eq!(json.matches("\"type\"").count(), 1);
-        let back: ServerMessage = serde_json::from_str(&json).expect("de");
-        assert_eq!(event, back);
     }
 
     #[test]
