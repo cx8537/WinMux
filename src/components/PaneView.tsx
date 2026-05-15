@@ -94,6 +94,10 @@ export function PaneView({ paneId, initialSnapshotBase64 }: PaneViewProps) {
       fontFamily: '"Cascadia Mono", "Consolas", "Courier New", monospace',
       fontSize: 14,
       cursorBlink: true,
+      // 기본 block 커서는 직사각형이라 두꺼워 보인다. 2px 세로 선 스타일로
+      // 변경 — `bar` 스타일은 `cursorWidth` 픽셀 단위 폭을 가진다.
+      cursorStyle: 'bar',
+      cursorWidth: 2,
       theme: CAMPBELL_THEME,
       scrollback: 10_000,
       convertEol: false,
